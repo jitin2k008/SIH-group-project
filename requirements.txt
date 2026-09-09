@@ -1,0 +1,14 @@
+# Explicit compatibility ranges; full installation could not be tested in the authoring environment.
+fastapi>=0.115.12,<1
+uvicorn[standard]>=0.34.2,<1
+SQLAlchemy>=2.0.40,<2.1
+psycopg2-binary>=2.9.10,<3
+python-dotenv>=1.1.0,<2
+passlib[bcrypt]==1.7.4
+# Required for compatibility with passlib 1.7.4 and existing bcrypt hashes.
+bcrypt==4.0.1
+python-jose[cryptography]>=3.4.0,<4
+pydantic[email]>=2.11.4,<3
+requests>=2.32.4,<3
+python-multipart>=0.0.20,<1
+alembic>=1.15.2,<2

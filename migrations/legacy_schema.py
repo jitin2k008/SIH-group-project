@@ -1,6 +1,8 @@
+"""Frozen original schema, used only to initialize/adopt the supplied legacy database."""
 from sqlalchemy import Column, Integer, String, Float, ForeignKey
 from sqlalchemy.orm import relationship
-from database import Base
+from sqlalchemy.orm import declarative_base
+Base = declarative_base()
 
 
 # One table for everyone (farmer or buyer). The "role" column tells them apart.

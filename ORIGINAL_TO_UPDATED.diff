@@ -1,0 +1,3367 @@
+--- original/auth.py
++++ farmdirect/auth.py
+@@ -1,64 +1,54 @@
+-import os
+-from datetime import datetime, timedelta
+-
+-from fastapi import Depends, HTTPException, status
++from datetime import datetime, timedelta, timezone
++from fastapi import Depends, HTTPException
+ from fastapi.security import OAuth2PasswordBearer
+-from jose import jwt, JWTError
++from jose import JWTError, jwt
+ from passlib.context import CryptContext
+ from sqlalchemy.orm import Session
+-
+ import models
+ from database import get_db
++from config import SECRET_KEY, ACCESS_TOKEN_EXPIRE_MINUTES
+ 
+-SECRET_KEY = os.getenv("SECRET_KEY", "change-this-secret-in-production")
+-ALGORITHM = "HS256"
+-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # token stays valid for 1 day
++ALGORITHM = 'HS256'
++pwd_context = CryptContext(schemes=['bcrypt'], deprecated='auto')
++oauth2_scheme = OAuth2PasswordBearer(tokenUrl='/auth/login')
+ 
+-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+-
+-# This tells FastAPI's docs page where to send login requests to get a token.
+-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+-
+-
+-def hash_password(password: str) -> str:
+-    """Turn a plain password into a scrambled hash before saving it to the DB."""
++def hash_password(password):
+     return pwd_context.hash(password)
+ 
++def verify_password(plain_password, hashed_password):
++    if len(plain_password.encode()) > 72:
++        return False
++    try:
++        return pwd_context.verify(plain_password, hashed_password)
++    except (ValueError, TypeError):
++        return False
+ 
+-def verify_password(plain_password: str, hashed_password: str) -> bool:
+-    """Check a login attempt's password against the stored hash."""
+-    return pwd_context.verify(plain_password, hashed_password)
++def create_access_token(data):
++    return jwt.encode({**data, 'type': 'access', 'exp': datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)}, SECRET_KEY, algorithm=ALGORITHM)
+ 
++def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
++    error = HTTPException(401, 'Could not validate credentials', headers={'WWW-Authenticate':'Bearer'})
++    try:
++        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM], options={'require_exp':True, 'require_sub':True})
++        if payload.get('type') != 'access':
++            raise error
++        user_id = int(payload['sub'])
++        if user_id <= 0:
++            raise error
++    except (JWTError, ValueError, TypeError, KeyError):
++        raise error
++    user = db.get(models.User, user_id)
++    if not user:
++        raise error
++    return user
+ 
+-def create_access_token(data: dict) -> str:
+-    """Build a signed JWT token that proves who the user is for future requests."""
+-    to_encode = data.copy()
+-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+-    to_encode.update({"exp": expire})
+-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
++def require_role(role):
++    def dependency(user: models.User = Depends(get_current_user)):
++        if user.role != role:
++            raise HTTPException(403, f'This action requires the {role} role')
++        return user
++    return dependency
+ 
+-
+-def get_current_user(
+-    token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
+-):
+-    """
+-    Use this as a dependency on any endpoint that should only work
+-    when the user is logged in (e.g. 'add produce', 'place order').
+-    """
+-    credentials_exception = HTTPException(
+-        status_code=status.HTTP_401_UNAUTHORIZED,
+-        detail="Could not validate credentials",
+-        headers={"WWW-Authenticate": "Bearer"},
+-    )
+-    try:
+-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+-        user_id = payload.get("sub")
+-        if user_id is None:
+-            raise credentials_exception
+-    except JWTError:
+-        raise credentials_exception
+-
+-    user = db.query(models.User).filter(models.User.id == int(user_id)).first()
+-    if user is None:
+-        raise credentials_exception
+-    return user
++require_farmer = require_role('farmer')
++require_buyer = require_role('buyer')
++require_transporter = require_role('transporter')
+--- original/auth_routes.py
++++ farmdirect/routers/auth_routes.py
+@@ -1,283 +1,55 @@
+ from fastapi import APIRouter, Depends, HTTPException
+ from fastapi.security import OAuth2PasswordRequestForm
+ from sqlalchemy.orm import Session
++from sqlalchemy.exc import IntegrityError
++import auth, models, schemas
++from database import get_db
++from services.common import commit
+ 
+-import auth
+-import models
+-import schemas
+-from database import get_db
++router = APIRouter(prefix='/auth', tags=['Authentication'])
+ 
+-router = APIRouter(
+-    prefix="/auth",
+-    tags=["Authentication"]
+-)
++def create_user(data, role, db):
++    if db.query(models.User).filter(models.User.email == str(data.email)).first():
++        raise HTTPException(409, 'Email already registered')
++    user = models.User(name=data.name, email=str(data.email), phone=data.phone,
++                       password_hash=auth.hash_password(data.password), role=role, location=data.location)
++    db.add(user)
++    try:
++        db.flush()  # CHANGED: get the ID without committing an incomplete account.
++    except IntegrityError:
++        db.rollback()
++        raise HTTPException(409, 'Email already registered')
++    return user
+ 
++@router.post('/register/farmer', response_model=schemas.UserOut, status_code=201)
++def register_farmer(user_in: schemas.FarmerRegister, db: Session = Depends(get_db)):
++    user = create_user(user_in, 'farmer', db)
++    db.add(models.Farmer(user_id=user.id, farm_name=user_in.farm_name,
++                         location=user_in.farm_location or user_in.location))
++    commit(db)
++    return user
+ 
+-# ==================================================
+-# FARMER REGISTRATION
+-# ==================================================
++@router.post('/register/buyer', response_model=schemas.UserOut, status_code=201)
++def register_buyer(user_in: schemas.BuyerRegister, db: Session = Depends(get_db)):
++    user = create_user(user_in, 'buyer', db)
++    commit(db)
++    return user
+ 
+-@router.post(
+-    "/register/farmer",
+-    response_model=schemas.UserOut
+-)
+-def register_farmer(
+-    user_in: schemas.FarmerRegister,
+-    db: Session = Depends(get_db)
+-):
+-    # ----------------------------------------------
+-    # Check if email already exists
+-    # ----------------------------------------------
++@router.post('/register/transporter', response_model=schemas.UserOut, status_code=201)
++def register_transporter(user_in: schemas.TransporterRegister, db: Session = Depends(get_db)):
++    user = create_user(user_in, 'transporter', db)
++    db.add(models.Transporter(user_id=user.id, vehicle_type=user_in.vehicle_type,
++        vehicle_number=user_in.vehicle_number, capacity_kg=user_in.capacity_kg))
++    commit(db)
++    return user
+ 
+-    existing_user = (
+-        db.query(models.User)
+-        .filter(models.User.email == user_in.email)
+-        .first()
+-    )
++@router.post('/login', response_model=schemas.Token)
++def login(credentials: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
++    user = db.query(models.User).filter(models.User.email == credentials.username.strip()).first()
++    if not user or not auth.verify_password(credentials.password, user.password_hash):
++        raise HTTPException(401, 'Incorrect email or password', headers={'WWW-Authenticate':'Bearer'})
++    return {'access_token':auth.create_access_token({'sub':str(user.id)}), 'token_type':'bearer'}
+ 
+-    if existing_user:
+-        raise HTTPException(
+-            status_code=400,
+-            detail="Email already registered"
+-        )
+-
+-    # ----------------------------------------------
+-    # Create User
+-    # ----------------------------------------------
+-
+-    new_user = models.User(
+-        name=user_in.name,
+-        email=user_in.email,
+-        phone=user_in.phone,
+-        password_hash=auth.hash_password(user_in.password),
+-        role="farmer",
+-        location=user_in.location
+-    )
+-
+-    db.add(new_user)
+-    db.commit()
+-    db.refresh(new_user)
+-
+-    # ----------------------------------------------
+-    # Create Farmer profile
+-    # ----------------------------------------------
+-
+-    farmer_profile = models.Farmer(
+-        user_id=new_user.id,
+-        farm_name=user_in.farm_name,
+-        location=user_in.location
+-    )
+-
+-    db.add(farmer_profile)
+-    db.commit()
+-
+-    return new_user
+-
+-
+-# ==================================================
+-# BUYER REGISTRATION
+-# ==================================================
+-
+-@router.post(
+-    "/register/buyer",
+-    response_model=schemas.UserOut
+-)
+-def register_buyer(
+-    user_in: schemas.BuyerRegister,
+-    db: Session = Depends(get_db)
+-):
+-    # ----------------------------------------------
+-    # Check if email already exists
+-    # ----------------------------------------------
+-
+-    existing_user = (
+-        db.query(models.User)
+-        .filter(models.User.email == user_in.email)
+-        .first()
+-    )
+-
+-    if existing_user:
+-        raise HTTPException(
+-            status_code=400,
+-            detail="Email already registered"
+-        )
+-
+-    # ----------------------------------------------
+-    # Create Buyer
+-    # ----------------------------------------------
+-
+-    new_user = models.User(
+-        name=user_in.name,
+-        email=user_in.email,
+-        phone=user_in.phone,
+-        password_hash=auth.hash_password(user_in.password),
+-        role="buyer",
+-        location=user_in.location
+-    )
+-
+-    db.add(new_user)
+-    db.commit()
+-    db.refresh(new_user)
+-
+-    return new_user
+-
+-
+-# ==================================================
+-# TRANSPORTER REGISTRATION
+-# ==================================================
+-
+-@router.post(
+-    "/register/transporter",
+-    response_model=schemas.UserOut
+-)
+-def register_transporter(
+-    user_in: schemas.TransporterRegister,
+-    db: Session = Depends(get_db)
+-):
+-    # ----------------------------------------------
+-    # Check email
+-    # ----------------------------------------------
+-
+-    existing_user = (
+-        db.query(models.User)
+-        .filter(models.User.email == user_in.email)
+-        .first()
+-    )
+-
+-    if existing_user:
+-        raise HTTPException(
+-            status_code=400,
+-            detail="Email already registered"
+-        )
+-
+-    # ----------------------------------------------
+-    # Validate capacity
+-    # ----------------------------------------------
+-
+-    if user_in.capacity_kg <= 0:
+-        raise HTTPException(
+-            status_code=400,
+-            detail="capacity_kg must be greater than 0"
+-        )
+-
+-    # ----------------------------------------------
+-    # Check vehicle number
+-    # ----------------------------------------------
+-
+-    existing_vehicle = (
+-        db.query(models.Transporter)
+-        .filter(
+-            models.Transporter.vehicle_number
+-            == user_in.vehicle_number
+-        )
+-        .first()
+-    )
+-
+-    if existing_vehicle:
+-        raise HTTPException(
+-            status_code=400,
+-            detail="Vehicle number is already registered"
+-        )
+-
+-    # ----------------------------------------------
+-    # Create User
+-    # ----------------------------------------------
+-
+-    new_user = models.User(
+-        name=user_in.name,
+-        email=user_in.email,
+-        phone=user_in.phone,
+-        password_hash=auth.hash_password(user_in.password),
+-        role="transporter",
+-        location=user_in.location
+-    )
+-
+-    db.add(new_user)
+-    db.commit()
+-    db.refresh(new_user)
+-
+-    # ----------------------------------------------
+-    # Create Transporter profile
+-    # ----------------------------------------------
+-
+-    transporter_profile = models.Transporter(
+-        user_id=new_user.id,
+-        vehicle_type=user_in.vehicle_type,
+-        vehicle_number=user_in.vehicle_number,
+-        capacity_kg=user_in.capacity_kg,
+-        is_available="available"
+-    )
+-
+-    db.add(transporter_profile)
+-    db.commit()
+-
+-    return new_user
+-
+-
+-# ==================================================
+-# LOGIN
+-# ==================================================
+-#
+-# Swagger OAuth2 sends:
+-#
+-# username = email
+-# password = password
+-#
+-# We use the email as the username.
+-# ==================================================
+-
+-@router.post(
+-    "/login",
+-    response_model=schemas.Token
+-)
+-def login(
+-    credentials: OAuth2PasswordRequestForm = Depends(),
+-    db: Session = Depends(get_db)
+-):
+-    user = (
+-        db.query(models.User)
+-        .filter(
+-            models.User.email == credentials.username
+-        )
+-        .first()
+-    )
+-
+-    if not user or not auth.verify_password(
+-        credentials.password,
+-        user.password_hash
+-    ):
+-        raise HTTPException(
+-            status_code=401,
+-            detail="Incorrect email or password",
+-            headers={
+-                "WWW-Authenticate": "Bearer"
+-            }
+-        )
+-
+-    token = auth.create_access_token(
+-        data={
+-            "sub": str(user.id),
+-            "role": user.role
+-        }
+-    )
+-
+-    return {
+-        "access_token": token,
+-        "token_type": "bearer"
+-    }
+-
+-
+-# ==================================================
+-# CURRENT USER
+-# ==================================================
+-
+-@router.get(
+-    "/me",
+-    response_model=schemas.UserOut
+-)
+-def get_me(
+-    current_user: models.User = Depends(
+-        auth.get_current_user
+-    )
+-):
+-    return current_user+@router.get('/me', response_model=schemas.UserOut)
++def get_me(user: models.User = Depends(auth.get_current_user)):
++    return user
+--- original/database.py
++++ farmdirect/database.py
+@@ -1,27 +1,15 @@
+-import os
+ from sqlalchemy import create_engine
+-from sqlalchemy.ext.declarative import declarative_base
+-from sqlalchemy.orm import sessionmaker
+-from dotenv import load_dotenv
++from sqlalchemy.orm import declarative_base, sessionmaker
++from config import DATABASE_URL
+ 
+-load_dotenv()
+-
+-# Reads DATABASE_URL from the .env file.
+-# Falls back to a local default if nothing is set (change this to match your setup).
+-DATABASE_URL = os.getenv(
+-    "DATABASE_URL", "postgresql://postgres:kali@localhost:5432/farmdirect"
+-)
+-
+-engine = create_engine(DATABASE_URL)
+-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
++engine = create_engine(DATABASE_URL, pool_pre_ping=True)
++SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+ Base = declarative_base()
+ 
+-
+-# FastAPI will call this for every request that needs DB access.
+-# It opens a session, hands it to the endpoint, then closes it afterwards.
+ def get_db():
+-    db = SessionLocal()
+-    try:
+-        yield db
+-    finally:
+-        db.close()
++    with SessionLocal() as db:
++        try:
++            yield db
++        except Exception:
++            db.rollback()
++            raise
+--- original/delivery_routes.py
++++ farmdirect/routers/delivery_routes.py
+@@ -1,1118 +1,136 @@
+-from fastapi import APIRouter, Depends, HTTPException
+-from sqlalchemy.orm import Session
++"""CHANGED: transitions are atomic. Lock order: Delivery -> Order -> Product -> Transporter."""
++from decimal import Decimal
++from fastapi import APIRouter, Depends, HTTPException, Query
++from sqlalchemy.orm import Session, selectinload
++import auth, models, schemas
++from database import get_db
++from services.common import get_or_404, commit
++from services.pricing import make_quote
+ 
+-import auth
+-import models
+-import schemas
+-from database import get_db
+-from services.map_service import get_route_distance
++router = APIRouter(prefix='/deliveries', tags=['Deliveries'])
++TRANSITIONS = {'assigned':{'picked_up','failed'}, 'picked_up':{'in_transit','failed'},
++               'in_transit':{'delivered','failed'}}
+ 
++def build_delivery_response(delivery):
++    order = delivery.order
++    return {'id':delivery.id, 'order_id':order.id, 'transporter_id':delivery.transporter_id,
++        'product_name':order.product_name or order.product.name, 'quantity':order.quantity,
++        'unit':order.unit or order.product.unit, 'pickup_location':delivery.pickup_location,
++        'delivery_location':delivery.delivery_location, 'transport_cost':delivery.transport_cost,
++        'status':delivery.status}
+ 
+-router = APIRouter(
+-    prefix="/deliveries",
+-    tags=["Deliveries"]
+-)
++def transporter_profile(db, user_id):
++    row = (db.query(models.Transporter).filter(models.Transporter.user_id == user_id)
++           .populate_existing().with_for_update().first())
++    if row is None:
++        raise HTTPException(409, 'Transporter profile is missing')
++    return row
+ 
++def free_transporter(db, user_id, finished_delivery_id):
++    transporter = transporter_profile(db, user_id)
++    # Also handles legacy users who were assigned multiple jobs by the original backend.
++    another = db.query(models.Delivery.id).filter(models.Delivery.transporter_id == user_id,
++        models.Delivery.id != finished_delivery_id,
++        models.Delivery.status.in_(['assigned','picked_up','in_transit','failed'])).first()
++    transporter.is_available = 'busy' if another else 'available'
+ 
+-# ==================================================
+-# VEHICLE RATE CONFIGURATION
+-# ==================================================
+-# Fixed prototype rates for SIH.
+-#
+-# These are charged per kilometer.
+-# ==================================================
++@router.get('/estimate')
++def get_delivery_estimate(product_id: int, quantity: Decimal = Query(..., gt=0, le=20000, decimal_places=3),
++                          destination: str = Query(..., min_length=1, max_length=250),
++                          db: Session = Depends(get_db), user: models.User = Depends(auth.require_buyer)):
++    if not quantity.is_finite():
++        raise HTTPException(422, 'Quantity must be finite')
++    product = get_or_404(db, models.Product, product_id)
++    return make_quote(product, quantity, destination.strip(), user.id)
+ 
+-VEHICLE_RATES = {
+-    "Small Pickup": 10.0,
+-    "Mini Truck": 15.0,
+-    "Medium Truck": 20.0,
+-    "Large Truck": 25.0
+-}
++def delivery_list(db, condition, offset, limit):
++    rows = (db.query(models.Delivery).filter(condition)
++        .options(selectinload(models.Delivery.order).selectinload(models.Order.product))
++        .order_by(models.Delivery.id.desc()).offset(offset).limit(limit).all())
++    return [build_delivery_response(d) for d in rows]
+ 
++@router.get('/available', response_model=list[schemas.DeliveryOut])
++def get_available_deliveries(db: Session = Depends(get_db), user: models.User = Depends(auth.require_transporter),
++                            offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=100)):
++    return delivery_list(db, models.Delivery.status == 'available', offset, limit)
+ 
+-# ==================================================
+-# SELECT VEHICLE BASED ON QUANTITY
+-# ==================================================
+-def get_vehicle_for_quantity(quantity_kg: float):
+-    """
+-    Select the smallest suitable vehicle based on
+-    the quantity being transported.
++@router.get('/my', response_model=list[schemas.DeliveryOut])
++def get_my_deliveries(db: Session = Depends(get_db), user: models.User = Depends(auth.require_transporter),
++                      offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=100)):
++    return delivery_list(db, models.Delivery.transporter_id == user.id, offset, limit)
+ 
+-    These limits are prototype values for SIH and
+-    can be adjusted later.
+-    """
++@router.post('/{delivery_id}/accept', response_model=schemas.DeliveryOut)
++def accept_delivery(delivery_id: int, db: Session = Depends(get_db),
++                    user: models.User = Depends(auth.require_transporter)):
++    delivery = get_or_404(db, models.Delivery, delivery_id, lock=True)
++    if delivery.status != 'available':
++        raise HTTPException(409, 'This delivery is no longer available')
++    order = get_or_404(db, models.Order, delivery.order_id, lock=True)
++    if order.status != 'accepted':
++        raise HTTPException(409, 'Order is not ready for delivery')
++    unit = order.unit or order.product.unit
++    if unit.lower() not in {'kg','kgs','kilogram','kilograms'}:
++        raise HTTPException(409, 'Legacy delivery weight is not in kilograms; resolve before assignment')
++    transporter = transporter_profile(db, user.id)
++    active = db.query(models.Delivery.id).filter(models.Delivery.transporter_id == user.id,
++        models.Delivery.status.in_(['assigned','picked_up','in_transit','failed'])).first()
++    if transporter.is_available != 'available' or active:
++        raise HTTPException(409, 'Complete or return your current delivery before accepting another')
++    if transporter.capacity_kg < order.quantity:
++        raise HTTPException(409, 'Vehicle capacity is insufficient')
++    delivery.transporter_id = user.id
++    delivery.status = 'assigned'
++    transporter.is_available = 'busy'
++    commit(db)
++    return build_delivery_response(delivery)
+ 
+-    if quantity_kg <= 100:
+-        return "Small Pickup", VEHICLE_RATES["Small Pickup"]
++@router.put('/{delivery_id}/status', response_model=schemas.DeliveryOut)
++def update_delivery_status(delivery_id: int, status_update: schemas.DeliveryStatusUpdate,
++                           db: Session = Depends(get_db), user: models.User = Depends(auth.require_transporter)):
++    delivery = get_or_404(db, models.Delivery, delivery_id, lock=True)
++    if delivery.transporter_id != user.id:
++        raise HTTPException(403, 'You can only manage your own deliveries')
++    if status_update.status not in TRANSITIONS.get(delivery.status, set()):
++        raise HTTPException(409, f'Cannot change {delivery.status} to {status_update.status}')
++    order = get_or_404(db, models.Order, delivery.order_id, lock=True)
++    delivery.status = status_update.status
++    if delivery.status == 'delivered':
++        order.status = 'completed'
++        free_transporter(db, user.id, delivery.id)
++    elif delivery.status == 'failed':
++        order.status = 'delivery_failed'
++        # Goods may still be with the driver: keep stock reserved and transporter busy.
++    commit(db)
++    return build_delivery_response(delivery)
+ 
+-    elif quantity_kg <= 500:
+-        return "Mini Truck", VEHICLE_RATES["Mini Truck"]
++@router.post('/{delivery_id}/confirm-return', response_model=schemas.DeliveryOut)
++def confirm_goods_return(delivery_id: int, db: Session = Depends(get_db),
++                         user: models.User = Depends(auth.require_farmer)):
++    delivery = get_or_404(db, models.Delivery, delivery_id, lock=True)
++    order = get_or_404(db, models.Order, delivery.order_id, lock=True)
++    product = get_or_404(db, models.Product, order.product_id, lock=True)
++    if product.farmer_id != user.id:
++        raise HTTPException(403, 'You can only confirm returns for your products')
++    if delivery.status == 'returned':
++        return build_delivery_response(delivery)  # Idempotent: stock is not added again.
++    if delivery.status != 'failed' or order.status != 'delivery_failed':
++        raise HTTPException(409, 'Only failed deliveries can be returned')
++    product.quantity += order.quantity
++    delivery.status = 'returned'
++    order.status = 'returned'
++    if delivery.transporter_id is not None:
++        free_transporter(db, delivery.transporter_id, delivery.id)
++    commit(db)
++    return build_delivery_response(delivery)
+ 
+-    elif quantity_kg <= 2000:
+-        return "Medium Truck", VEHICLE_RATES["Medium Truck"]
+-
+-    else:
+-        return "Large Truck", VEHICLE_RATES["Large Truck"]
+-
+-
+-# ==================================================
+-# BUILD DELIVERY RESPONSE
+-# ==================================================
+-# Product information is obtained through:
+-#
+-# Delivery -> Order -> Product
+-#
+-# We do not duplicate product information inside
+-# the Delivery database table.
+-# ==================================================
+-
+-def build_delivery_response(
+-    delivery: models.Delivery,
+-    db: Session
+-):
+-
+-    # --------------------------------------------------
+-    # Find order
+-    # --------------------------------------------------
+-    order = (
+-        db.query(models.Order)
+-        .filter(
+-            models.Order.id == delivery.order_id
+-        )
+-        .first()
+-    )
+-
+-    if not order:
+-        raise HTTPException(
+-            status_code=404,
+-            detail="Order not found"
+-        )
+-
+-    # --------------------------------------------------
+-    # Find product
+-    # --------------------------------------------------
+-    product = (
+-        db.query(models.Product)
+-        .filter(
+-            models.Product.id == order.product_id
+-        )
+-        .first()
+-    )
+-
+-    if not product:
+-        raise HTTPException(
+-            status_code=404,
+-            detail="Product not found"
+-        )
+-
+-    # --------------------------------------------------
+-    # Return complete delivery information
+-    # --------------------------------------------------
+-    return {
+-        "id": delivery.id,
+-        "order_id": delivery.order_id,
+-
+-        "product_name": product.name,
+-        "quantity": order.quantity,
+-        "unit": product.unit,
+-
+-        "pickup_location": delivery.pickup_location,
+-        "delivery_location": delivery.delivery_location,
+-
+-        "transport_cost": delivery.transport_cost,
+-        "status": delivery.status
+-    }
+-
+-
+-# ==================================================
+-# GET DELIVERY ESTIMATE
+-# ==================================================
+-# Buyer can request an estimate BEFORE placing
+-# an order.
+-#
+-# This does NOT create an order.
+-#
+-# Input:
+-#   product_id
+-#   quantity
+-#   destination
+-#
+-# Output:
+-#   product cost
+-#   road distance
+-#   vehicle type
+-#   vehicle rate
+-#   transport cost
+-#   estimated total
+-# ==================================================
+-
+-@router.get("/estimate")
+-def get_delivery_estimate(
+-    product_id: int,
+-    quantity: float,
+-    destination: str,
+-    db: Session = Depends(get_db),
+-    current_user: models.User = Depends(
+-        auth.get_current_user
+-    )
+-):
+-
+-    # --------------------------------------------------
+-    # Only buyers can request an estimate
+-    # --------------------------------------------------
+-    if current_user.role != "buyer":
+-        raise HTTPException(
+-            status_code=403,
+-            detail="Only buyers can request delivery estimates"
+-        )
+-
+-    # --------------------------------------------------
+-    # Validate quantity
+-    # --------------------------------------------------
+-    if quantity <= 0:
+-        raise HTTPException(
+-            status_code=400,
+-            detail="Quantity must be greater than 0"
+-        )
+-
+-    # --------------------------------------------------
+-    # Find product
+-    # --------------------------------------------------
+-    product = (
+-        db.query(models.Product)
+-        .filter(
+-            models.Product.id == product_id
+-        )
+-        .first()
+-    )
+-
+-    if not product:
+-        raise HTTPException(
+-            status_code=404,
+-            detail="Product not found"
+-        )
+-
+-    # --------------------------------------------------
+-    # Check available stock
+-    # --------------------------------------------------
+-    if quantity > product.quantity:
+-        raise HTTPException(
+-            status_code=400,
+-            detail=(
+-                f"Only {product.quantity} "
+-                f"{product.unit} available"
+-            )
+-        )
+-
+-    # --------------------------------------------------
+-    # Current prototype works with kilograms
+-    # because transporter capacity is stored in kg.
+-    # --------------------------------------------------
+-    if product.unit.lower() not in (
+-        "kg",
+-        "kgs",
+-        "kilogram",
+-        "kilograms"
+-    ):
+-        raise HTTPException(
+-            status_code=400,
+-            detail=(
+-                "Delivery estimation currently supports "
+-                "products listed in kilograms (kg)"
+-            )
+-        )
+-
+-    # --------------------------------------------------
+-    # Product pickup location
+-    # --------------------------------------------------
+-    pickup_location = product.location
+-
+-    if not pickup_location:
+-        raise HTTPException(
+-            status_code=400,
+-            detail="Product does not have a pickup location"
+-        )
+-
+-    # --------------------------------------------------
+-    # Validate destination
+-    # --------------------------------------------------
+-    if not destination or not destination.strip():
+-        raise HTTPException(
+-            status_code=400,
+-            detail="Destination cannot be empty"
+-        )
+-
+-    # --------------------------------------------------
+-    # Calculate road distance
+-    # --------------------------------------------------
+-    try:
+-
+-        distance_km = get_route_distance(
+-            pickup_location,
+-            destination
+-        )
+-
+-    except ValueError as e:
+-
+-        raise HTTPException(
+-            status_code=404,
+-            detail=str(e)
+-        )
+-
+-    except Exception:
+-
+-        raise HTTPException(
+-            status_code=500,
+-            detail="Could not calculate road distance"
+-        )
+-
+-    # --------------------------------------------------
+-    # Select suitable vehicle
+-    # --------------------------------------------------
+-    vehicle_type, vehicle_rate = (
+-        get_vehicle_for_quantity(quantity)
+-    )
+-
+-    # --------------------------------------------------
+-    # Calculate product cost
+-    # --------------------------------------------------
+-    product_cost = (
+-        quantity *
+-        product.price_per_unit
+-    )
+-
+-    # --------------------------------------------------
+-    # Calculate transport cost
+-    # --------------------------------------------------
+-    transport_cost = (
+-        distance_km *
+-        vehicle_rate
+-    )
+-
+-    # --------------------------------------------------
+-    # Calculate estimated total
+-    # --------------------------------------------------
+-    estimated_total = (
+-        product_cost +
+-        transport_cost
+-    )
+-
+-    # --------------------------------------------------
+-    # Return estimate
+-    # --------------------------------------------------
+-    return {
+-        "product_id": product.id,
+-        "product_name": product.name,
+-
+-        "quantity": quantity,
+-        "unit": product.unit,
+-
+-        "price_per_unit": product.price_per_unit,
+-        "product_cost": round(
+-            product_cost,
+-            2
+-        ),
+-
+-        "pickup_location": pickup_location,
+-        "destination": destination,
+-
+-        "distance_km": distance_km,
+-
+-        "vehicle_type": vehicle_type,
+-        "vehicle_rate_per_km": vehicle_rate,
+-
+-        "transport_cost": round(
+-            transport_cost,
+-            2
+-        ),
+-
+-        "estimated_total": round(
+-            estimated_total,
+-            2
+-        )
+-    }
+-
+-
+-# ==================================================
+-# GET AVAILABLE DELIVERIES
+-# ==================================================
+-# Only transporters can see available delivery jobs.
+-# ==================================================
+-
+-@router.get(
+-    "/available",
+-    response_model=list[schemas.DeliveryOut]
+-)
+-def get_available_deliveries(
+-    db: Session = Depends(get_db),
+-    current_user: models.User = Depends(
+-        auth.get_current_user
+-    )
+-):
+-
+-    # --------------------------------------------------
+-    # Only transporters
+-    # --------------------------------------------------
+-    if current_user.role != "transporter":
+-        raise HTTPException(
+-            status_code=403,
+-            detail="Only transporters can view delivery jobs"
+-        )
+-
+-    deliveries = (
+-        db.query(models.Delivery)
+-        .filter(
+-            models.Delivery.status == "available"
+-        )
+-        .all()
+-    )
+-
+-    return [
+-        build_delivery_response(
+-            delivery,
+-            db
+-        )
+-        for delivery in deliveries
+-    ]
+-
+-
+-# ==================================================
+-# ACCEPT DELIVERY
+-# ==================================================
+-# Transporter accepts an available delivery.
+-# ==================================================
+-
+-@router.post(
+-    "/{delivery_id}/accept",
+-    response_model=schemas.DeliveryOut
+-)
+-def accept_delivery(
+-    delivery_id: int,
+-    db: Session = Depends(get_db),
+-    current_user: models.User = Depends(
+-        auth.get_current_user
+-    )
+-):
+-
+-    # --------------------------------------------------
+-    # Only transporters
+-    # --------------------------------------------------
+-    if current_user.role != "transporter":
+-        raise HTTPException(
+-            status_code=403,
+-            detail="Only transporters can accept deliveries"
+-        )
+-
+-    # --------------------------------------------------
+-    # Find delivery
+-    # --------------------------------------------------
+-    delivery = (
+-        db.query(models.Delivery)
+-        .filter(
+-            models.Delivery.id == delivery_id
+-        )
+-        .first()
+-    )
+-
+-    if not delivery:
+-        raise HTTPException(
+-            status_code=404,
+-            detail="Delivery not found"
+-        )
+-
+-    # --------------------------------------------------
+-    # Must still be available
+-    # --------------------------------------------------
+-    if delivery.status != "available":
+-        raise HTTPException(
+-            status_code=400,
+-            detail="This delivery is no longer available"
+-        )
+-
+-    # --------------------------------------------------
+-    # Find transporter profile
+-    # --------------------------------------------------
+-    transporter = (
+-        db.query(models.Transporter)
+-        .filter(
+-            models.Transporter.user_id ==
+-            current_user.id
+-        )
+-        .first()
+-    )
+-
+-    if not transporter:
+-        raise HTTPException(
+-            status_code=404,
+-            detail="Transporter profile not found"
+-        )
+-
+-    # --------------------------------------------------
+-    # Find order
+-    # --------------------------------------------------
+-    order = (
+-        db.query(models.Order)
+-        .filter(
+-            models.Order.id ==
+-            delivery.order_id
+-        )
+-        .first()
+-    )
+-
+-    if not order:
+-        raise HTTPException(
+-            status_code=404,
+-            detail="Order not found"
+-        )
+-
+-    # --------------------------------------------------
+-    # Check vehicle capacity
+-    # --------------------------------------------------
+-    if transporter.capacity_kg < order.quantity:
+-        raise HTTPException(
+-            status_code=400,
+-            detail=(
+-                "Vehicle capacity is insufficient "
+-                "for this order"
+-            )
+-        )
+-
+-    # --------------------------------------------------
+-    # Assign transporter
+-    # --------------------------------------------------
+-    delivery.transporter_id = current_user.id
+-    delivery.status = "assigned"
+-
+-    # Transporter becomes busy
+-    transporter.is_available = "busy"
+-
+-    # --------------------------------------------------
+-    # Save
+-    # --------------------------------------------------
+-    try:
+-
+-        db.commit()
+-        db.refresh(delivery)
+-
+-    except Exception:
+-
+-        db.rollback()
+-
+-        raise HTTPException(
+-            status_code=500,
+-            detail="Could not accept delivery"
+-        )
+-
+-    return build_delivery_response(
+-        delivery,
+-        db
+-    )
+-
+-
+-# ==================================================
+-# UPDATE DELIVERY STATUS
+-# ==================================================
+-#
+-# Normal:
+-#
+-# assigned
+-#     ↓
+-# picked_up
+-#     ↓
+-# in_transit
+-#     ↓
+-# delivered
+-#
+-# Failure:
+-#
+-# assigned
+-#     ↓
+-# failed
+-#
+-# picked_up
+-#     ↓
+-# failed
+-#
+-# in_transit
+-#     ↓
+-# failed
+-#
+-# Stock is NOT restored on failure.
+-# Farmer confirms return first.
+-# ==================================================
+-
+-@router.put(
+-    "/{delivery_id}/status",
+-    response_model=schemas.DeliveryOut
+-)
+-def update_delivery_status(
+-    delivery_id: int,
+-    status_update: schemas.OrderStatusUpdate,
+-    db: Session = Depends(get_db),
+-    current_user: models.User = Depends(
+-        auth.get_current_user
+-    )
+-):
+-
+-    # --------------------------------------------------
+-    # Only transporters
+-    # --------------------------------------------------
+-    if current_user.role != "transporter":
+-        raise HTTPException(
+-            status_code=403,
+-            detail=(
+-                "Only transporters can "
+-                "update delivery status"
+-            )
+-        )
+-
+-    # --------------------------------------------------
+-    # Allowed statuses
+-    # --------------------------------------------------
+-    allowed_statuses = {
+-        "picked_up",
+-        "in_transit",
+-        "delivered",
+-        "failed"
+-    }
+-
+-    if status_update.status not in allowed_statuses:
+-        raise HTTPException(
+-            status_code=400,
+-            detail=(
+-                "Invalid delivery status. "
+-                "Use picked_up, in_transit, "
+-                "delivered, or failed"
+-            )
+-        )
+-
+-    # --------------------------------------------------
+-    # Find delivery
+-    # --------------------------------------------------
+-    delivery = (
+-        db.query(models.Delivery)
+-        .filter(
+-            models.Delivery.id ==
+-            delivery_id
+-        )
+-        .first()
+-    )
+-
+-    if not delivery:
+-        raise HTTPException(
+-            status_code=404,
+-            detail="Delivery not found"
+-        )
+-
+-    # --------------------------------------------------
+-    # Only assigned transporter
+-    # --------------------------------------------------
+-    if delivery.transporter_id != current_user.id:
+-        raise HTTPException(
+-            status_code=403,
+-            detail="You can only manage your own deliveries"
+-        )
+-
+-    # --------------------------------------------------
+-    # Valid status transitions
+-    # --------------------------------------------------
+-    valid_transitions = {
+-        "assigned": {
+-            "picked_up",
+-            "failed"
+-        },
+-
+-        "picked_up": {
+-            "in_transit",
+-            "failed"
+-        },
+-
+-        "in_transit": {
+-            "delivered",
+-            "failed"
+-        }
+-    }
+-
+-    current_status = delivery.status
+-    new_status = status_update.status
+-
+-    # --------------------------------------------------
+-    # Make sure current status can be updated
+-    # --------------------------------------------------
+-    if current_status not in valid_transitions:
+-        raise HTTPException(
+-            status_code=400,
+-            detail=(
+-                f"Delivery cannot be updated "
+-                f"from '{current_status}'"
+-            )
+-        )
+-
+-    # --------------------------------------------------
+-    # Check transition
+-    # --------------------------------------------------
+-    if new_status not in valid_transitions[
+-        current_status
+-    ]:
+-        raise HTTPException(
+-            status_code=400,
+-            detail=(
+-                f"Cannot change delivery from "
+-                f"'{current_status}' to "
+-                f"'{new_status}'"
+-            )
+-        )
+-
+-    # --------------------------------------------------
+-    # Update delivery status
+-    # --------------------------------------------------
+-    delivery.status = new_status
+-
+-    # ==================================================
+-    # SUCCESSFUL DELIVERY
+-    # ==================================================
+-    if new_status == "delivered":
+-
+-        # --------------------------------------------------
+-        # Free transporter
+-        # --------------------------------------------------
+-        transporter = (
+-            db.query(models.Transporter)
+-            .filter(
+-                models.Transporter.user_id ==
+-                current_user.id
+-            )
+-            .first()
+-        )
+-
+-        if transporter:
+-            transporter.is_available = "available"
+-
+-        # --------------------------------------------------
+-        # Complete order
+-        # --------------------------------------------------
+-        order = (
+-            db.query(models.Order)
+-            .filter(
+-                models.Order.id ==
+-                delivery.order_id
+-            )
+-            .first()
+-        )
+-
+-        if order:
+-            order.status = "completed"
+-
+-    # ==================================================
+-    # FAILED DELIVERY
+-    # ==================================================
+-    elif new_status == "failed":
+-
+-        # --------------------------------------------------
+-        # IMPORTANT:
+-        #
+-        # Do NOT restore stock here.
+-        #
+-        # Goods may still be physically with the
+-        # transporter.
+-        # --------------------------------------------------
+-
+-        order = (
+-            db.query(models.Order)
+-            .filter(
+-                models.Order.id ==
+-                delivery.order_id
+-            )
+-            .first()
+-        )
+-
+-        if order:
+-            order.status = "delivery_failed"
+-
+-        # Transporter remains busy until goods return.
+-
+-    # --------------------------------------------------
+-    # Save
+-    # --------------------------------------------------
+-    try:
+-
+-        db.commit()
+-        db.refresh(delivery)
+-
+-    except Exception:
+-
+-        db.rollback()
+-
+-        raise HTTPException(
+-            status_code=500,
+-            detail="Could not update delivery status"
+-        )
+-
+-    return build_delivery_response(
+-        delivery,
+-        db
+-    )
+-
+-
+-# ==================================================
+-# CONFIRM GOODS RETURN
+-# ==================================================
+-#
+-# Only the farmer who owns the product can confirm
+-# that goods from a failed delivery have returned.
+-#
+-# ONLY HERE is the inventory restored.
+-#
+-# failed
+-#    ↓
+-# farmer confirms return
+-#    ↓
+-# returned
+-#    ↓
+-# stock restored
+-# ==================================================
+-
+-@router.post(
+-    "/{delivery_id}/confirm-return",
+-    response_model=schemas.DeliveryOut
+-)
+-def confirm_goods_return(
+-    delivery_id: int,
+-    db: Session = Depends(get_db),
+-    current_user: models.User = Depends(
+-        auth.get_current_user
+-    )
+-):
+-
+-    # --------------------------------------------------
+-    # Only farmers
+-    # --------------------------------------------------
+-    if current_user.role != "farmer":
+-        raise HTTPException(
+-            status_code=403,
+-            detail="Only farmers can confirm returned goods"
+-        )
+-
+-    # --------------------------------------------------
+-    # Find delivery
+-    # --------------------------------------------------
+-    delivery = (
+-        db.query(models.Delivery)
+-        .filter(
+-            models.Delivery.id ==
+-            delivery_id
+-        )
+-        .first()
+-    )
+-
+-    if not delivery:
+-        raise HTTPException(
+-            status_code=404,
+-            detail="Delivery not found"
+-        )
+-
+-    # --------------------------------------------------
+-    # Only failed deliveries can be returned
+-    # --------------------------------------------------
+-    if delivery.status != "failed":
+-        raise HTTPException(
+-            status_code=400,
+-            detail=(
+-                "Only failed deliveries can "
+-                "be marked as returned"
+-            )
+-        )
+-
+-    # --------------------------------------------------
+-    # Find order
+-    # --------------------------------------------------
+-    order = (
+-        db.query(models.Order)
+-        .filter(
+-            models.Order.id ==
+-            delivery.order_id
+-        )
+-        .first()
+-    )
+-
+-    if not order:
+-        raise HTTPException(
+-            status_code=404,
+-            detail="Order not found"
+-        )
+-
+-    # --------------------------------------------------
+-    # Find product
+-    # --------------------------------------------------
+-    product = (
+-        db.query(models.Product)
+-        .filter(
+-            models.Product.id ==
+-            order.product_id
+-        )
+-        .first()
+-    )
+-
+-    if not product:
+-        raise HTTPException(
+-            status_code=404,
+-            detail="Product not found"
+-        )
+-
+-    # --------------------------------------------------
+-    # Farmer ownership check
+-    # --------------------------------------------------
+-    if product.farmer_id != current_user.id:
+-        raise HTTPException(
+-            status_code=403,
+-            detail=(
+-                "You can only confirm returns "
+-                "for your own products"
+-            )
+-        )
+-
+-    # ==================================================
+-    # RESTORE STOCK
+-    # ==================================================
+-    product.quantity += order.quantity
+-
+-    # --------------------------------------------------
+-    # Mark delivery returned
+-    # --------------------------------------------------
+-    delivery.status = "returned"
+-
+-    # --------------------------------------------------
+-    # Mark order returned
+-    # --------------------------------------------------
+-    order.status = "returned"
+-
+-    # --------------------------------------------------
+-    # Free transporter
+-    # --------------------------------------------------
+-    if delivery.transporter_id is not None:
+-
+-        transporter = (
+-            db.query(models.Transporter)
+-            .filter(
+-                models.Transporter.user_id ==
+-                delivery.transporter_id
+-            )
+-            .first()
+-        )
+-
+-        if transporter:
+-            transporter.is_available = "available"
+-
+-    # --------------------------------------------------
+-    # Save
+-    # --------------------------------------------------
+-    try:
+-
+-        db.commit()
+-        db.refresh(delivery)
+-
+-    except Exception:
+-
+-        db.rollback()
+-
+-        raise HTTPException(
+-            status_code=500,
+-            detail="Could not confirm goods return"
+-        )
+-
+-    return build_delivery_response(
+-        delivery,
+-        db
+-    )
+-
+-
+-# ==================================================
+-# GET MY DELIVERIES
+-# ==================================================
+-# Transporter sees their own deliveries.
+-# ==================================================
+-
+-@router.get(
+-    "/my",
+-    response_model=list[schemas.DeliveryOut]
+-)
+-def get_my_deliveries(
+-    db: Session = Depends(get_db),
+-    current_user: models.User = Depends(
+-        auth.get_current_user
+-    )
+-):
+-
+-    # --------------------------------------------------
+-    # Only transporters
+-    # --------------------------------------------------
+-    if current_user.role != "transporter":
+-        raise HTTPException(
+-            status_code=403,
+-            detail=(
+-                "Only transporters can "
+-                "view their deliveries"
+-            )
+-        )
+-
+-    deliveries = (
+-        db.query(models.Delivery)
+-        .filter(
+-            models.Delivery.transporter_id ==
+-            current_user.id
+-        )
+-        .all()
+-    )
+-
+-    return [
+-        build_delivery_response(
+-            delivery,
+-            db
+-        )
+-        for delivery in deliveries
+-    ]
+-
+-
+-# ==================================================
+-# GET ONE DELIVERY
+-# ==================================================
+-#
+-# Transporter:
+-#   Only their own delivery.
+-#
+-# Buyer:
+-#   Only deliveries belonging to their orders.
+-#
+-# Farmer:
+-#   Only deliveries involving their products.
+-# ==================================================
+-
+-@router.get(
+-    "/{delivery_id}",
+-    response_model=schemas.DeliveryOut
+-)
+-def get_delivery(
+-    delivery_id: int,
+-    db: Session = Depends(get_db),
+-    current_user: models.User = Depends(
+-        auth.get_current_user
+-    )
+-):
+-
+-    # --------------------------------------------------
+-    # Find delivery
+-    # --------------------------------------------------
+-    delivery = (
+-        db.query(models.Delivery)
+-        .filter(
+-            models.Delivery.id ==
+-            delivery_id
+-        )
+-        .first()
+-    )
+-
+-    if not delivery:
+-        raise HTTPException(
+-            status_code=404,
+-            detail="Delivery not found"
+-        )
+-
+-    # ==================================================
+-    # TRANSPORTER
+-    # ==================================================
+-
+-    if current_user.role == "transporter":
+-
+-        if delivery.transporter_id != current_user.id:
+-            raise HTTPException(
+-                status_code=403,
+-                detail=(
+-                    "You can only view "
+-                    "your own deliveries"
+-                )
+-            )
+-
+-    # ==================================================
+-    # BUYER / FARMER
+-    # ==================================================
+-
+-    elif current_user.role in (
+-        "buyer",
+-        "farmer"
+-    ):
+-
+-        # --------------------------------------------------
+-        # Find order
+-        # --------------------------------------------------
+-        order = (
+-            db.query(models.Order)
+-            .filter(
+-                models.Order.id ==
+-                delivery.order_id
+-            )
+-            .first()
+-        )
+-
+-        if not order:
+-            raise HTTPException(
+-                status_code=404,
+-                detail="Order not found"
+-            )
+-
+-        # --------------------------------------------------
+-        # BUYER
+-        # --------------------------------------------------
+-        if current_user.role == "buyer":
+-
+-            if order.buyer_id != current_user.id:
+-                raise HTTPException(
+-                    status_code=403,
+-                    detail=(
+-                        "You can only view "
+-                        "your own deliveries"
+-                    )
+-                )
+-
+-        # --------------------------------------------------
+-        # FARMER
+-        # --------------------------------------------------
+-        elif current_user.role == "farmer":
+-
+-            product = (
+-                db.query(models.Product)
+-                .filter(
+-                    models.Product.id ==
+-                    order.product_id
+-                )
+-                .first()
+-            )
+-
+-            if not product:
+-                raise HTTPException(
+-                    status_code=404,
+-                    detail="Product not found"
+-                )
+-
+-            if product.farmer_id != current_user.id:
+-                raise HTTPException(
+-                    status_code=403,
+-                    detail=(
+-                        "You can only view deliveries "
+-                        "for your own products"
+-                    )
+-                )
+-
+-    # ==================================================
+-    # INVALID ROLE
+-    # ==================================================
+-    else:
+-
+-        raise HTTPException(
+-            status_code=403,
+-            detail="Invalid user role"
+-        )
+-
+-    return build_delivery_response(
+-        delivery,
+-        db
+-    )+@router.get('/{delivery_id}', response_model=schemas.DeliveryOut)
++def get_delivery(delivery_id: int, db: Session = Depends(get_db),
++                 user: models.User = Depends(auth.get_current_user)):
++    delivery = get_or_404(db, models.Delivery, delivery_id)
++    order = delivery.order
++    allowed = ((user.role == 'transporter' and delivery.transporter_id == user.id)
++        or (user.role == 'buyer' and order.buyer_id == user.id)
++        or (user.role == 'farmer' and order.product.farmer_id == user.id))
++    if not allowed:
++        raise HTTPException(403, 'You cannot view this delivery')
++    return build_delivery_response(delivery)
+--- original/main.py
++++ farmdirect/main.py
+@@ -1,24 +1,36 @@
+-from fastapi import FastAPI
+-from database import Base, engine
++import logging
++import os
++from fastapi import FastAPI, Request
++from fastapi.responses import JSONResponse
++from fastapi.middleware.cors import CORSMiddleware
++from sqlalchemy.exc import SQLAlchemyError
++from routers import auth_routes, product_routes, order_routes, delivery_routes, map_routes
++from services.map_service import LocationNotFound, MapUnavailable
+ 
+-from routers import map_routes
+-from routers import product_routes
+-from routers import auth_routes
+-from routers import order_routes
+-from routers import delivery_routes
++logging.basicConfig(level=logging.INFO)
++app = FastAPI(title='FarmDirect API', version='2.0.0')
++# CHANGED: migrations run explicitly, never during application import.
++origins = [s.strip() for s in os.getenv('CORS_ORIGINS', '').split(',') if s.strip()]
++if origins:
++    app.add_middleware(CORSMiddleware, allow_origins=origins,
++        allow_methods=['GET','POST','PUT','PATCH','DELETE'], allow_headers=['Authorization','Content-Type'])
++for module in [auth_routes, product_routes, order_routes, delivery_routes, map_routes]:
++    app.include_router(module.router)
+ 
+-# Creates database tables if they don't exist yet.
+-Base.metadata.create_all(bind=engine)
++@app.exception_handler(LocationNotFound)
++async def invalid_location(request: Request, exc: LocationNotFound):
++    return JSONResponse(status_code=422, content={'detail':str(exc)})
+ 
+-app = FastAPI(title="FarmDirect API")
++@app.exception_handler(MapUnavailable)
++async def unavailable_maps(request: Request, exc: MapUnavailable):
++    logging.getLogger(__name__).warning('Map provider failed: %s', type(exc.__cause__).__name__)
++    return JSONResponse(status_code=503, content={'detail':str(exc)})
+ 
+-app.include_router(map_routes.router)
+-app.include_router(delivery_routes.router)
+-app.include_router(auth_routes.router)
+-app.include_router(product_routes.router)
+-app.include_router(order_routes.router)
++@app.exception_handler(SQLAlchemyError)
++async def database_error(request: Request, exc: SQLAlchemyError):
++    logging.getLogger(__name__).error('Database operation failed: %s', type(exc).__name__)
++    return JSONResponse(status_code=503, content={'detail':'Database operation failed; try again'})
+ 
+-
+-@app.get("/")
++@app.get('/')
+ def root():
+-    return {"message": "FarmDirect API is running"}+    return {'message':'FarmDirect API is running'}
+--- original/map_routes.py
++++ farmdirect/routers/map_routes.py
+@@ -1,42 +1,14 @@
+-from fastapi import APIRouter, HTTPException
+-
++from typing import Annotated
++from fastapi import APIRouter, Depends, Query
++import auth, models
+ from services.map_service import get_route_distance
+ 
++router = APIRouter(prefix='/maps', tags=['Maps'])
+ 
+-router = APIRouter(
+-    prefix="/maps",
+-    tags=["Maps"]
+-)
+-
+-
+-# ==================================================
+-# GET ROAD DISTANCE
+-# ==================================================
+-@router.get("/distance")
+-def get_distance(
+-    pickup: str,
+-    destination: str
+-):
+-    try:
+-        distance = get_route_distance(
+-            pickup,
+-            destination
+-        )
+-
+-        return {
+-            "pickup": pickup,
+-            "destination": destination,
+-            "distance_km": distance
+-        }
+-
+-    except ValueError as e:
+-        raise HTTPException(
+-            status_code=404,
+-            detail=str(e)
+-        )
+-
+-    except Exception:
+-        raise HTTPException(
+-            status_code=500,
+-            detail="Could not calculate route distance"
+-        )+@router.get('/distance')
++def get_distance(pickup: Annotated[str, Query(min_length=1, max_length=250)],
++                 destination: Annotated[str, Query(min_length=1, max_length=250)],
++                 user: models.User = Depends(auth.get_current_user)):
++    return {'pickup':pickup, 'destination':destination,
++            'distance_km':get_route_distance(pickup, destination),
++            'attribution':'© OpenStreetMap contributors; route by OSRM'}
+--- original/map_service.py
++++ farmdirect/services/map_service.py
+@@ -1,89 +1,89 @@
++"""CHANGED: bounded caches, provider error types, and serialized geocoding.
++Public Nominatim: run ONE worker; use a managed provider for larger deployment.
++"""
++import os
++import time
++import math
++from collections import OrderedDict
++from threading import Lock
+ import requests
+ 
++NOMINATIM_URL = os.getenv('NOMINATIM_URL', 'https://nominatim.openstreetmap.org/search')
++OSRM_URL = os.getenv('OSRM_URL', 'https://router.project-osrm.org/route/v1/driving')
++_lock = Lock()
++_cache = OrderedDict()
++_last_geocode = 0.0
+ 
+-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+-OSRM_URL = "https://router.project-osrm.org/route/v1/driving"
++class LocationNotFound(ValueError):
++    pass
+ 
++class MapUnavailable(RuntimeError):
++    pass
+ 
+-def geocode_location(location: str):
+-    """
+-    Convert a human-readable address into latitude/longitude.
+-    """
++def _get(url, **kwargs):
++    try:
++        response = requests.get(url, timeout=(3, 10), **kwargs)
++        response.raise_for_status()
++        return response.json()
++    except (requests.RequestException, ValueError) as exc:
++        raise MapUnavailable('Map service is temporarily unavailable; try again') from exc
+ 
+-    params = {
+-        "q": location,
+-        "format": "json",
+-        "limit": 1
+-    }
++def _cached(key, fetch):
++    # The same lock prevents duplicate cache misses across concurrent requests.
++    with _lock:
++        entry = _cache.get(key)
++        if entry and time.monotonic() - entry[0] < 86400:
++            _cache.move_to_end(key)
++            return entry[1]
++        result = fetch()
++        _cache[key] = (time.monotonic(), result)
++        _cache.move_to_end(key)
++        while len(_cache) > 1000:
++            _cache.popitem(last=False)
++        return result
+ 
+-    headers = {
+-        "User-Agent": "FarmDirect-SIH/1.0"
+-    }
++def geocode_location(location):
++    location = location.strip()
++    if not location:
++        raise LocationNotFound('Location cannot be blank')
++    def fetch():
++        global _last_geocode
++        delay = 1.05 - (time.monotonic() - _last_geocode)
++        if delay > 0:
++            time.sleep(delay)
++        _last_geocode = time.monotonic()
++        results = _get(NOMINATIM_URL, params={'q':location, 'format':'json', 'limit':1},
++            headers={'User-Agent':os.getenv('MAP_USER_AGENT', 'FarmDirect/2.0')})
++        if results == []:
++            raise LocationNotFound(f'Could not find location: {location}')
++        try:
++            lat, lon = float(results[0]['lat']), float(results[0]['lon'])
++            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
++                raise ValueError()
++            return {'latitude':round(lat, 7), 'longitude':round(lon, 7),
++                    'display_name':str(results[0].get('display_name', location))}
++        except (KeyError, IndexError, TypeError, ValueError) as exc:
++            raise MapUnavailable('Map provider returned invalid coordinates') from exc
++    return dict(_cached(('geo', location.casefold()), fetch))
+ 
+-    response = requests.get(
+-        NOMINATIM_URL,
+-        params=params,
+-        headers=headers,
+-        timeout=10
+-    )
+-
+-    response.raise_for_status()
+-
+-    results = response.json()
+-
+-    if not results:
+-        raise ValueError(
+-            f"Could not find location: {location}"
+-        )
+-
+-    return {
+-        "latitude": float(results[0]["lat"]),
+-        "longitude": float(results[0]["lon"])
+-    }
+-
+-
+-def get_route_distance(
+-    pickup_location: str,
+-    delivery_location: str
+-):
+-    """
+-    Get road distance between pickup and delivery locations.
+-    Returns distance in kilometers.
+-    """
+-
++def get_route_details(pickup_location, delivery_location):
+     pickup = geocode_location(pickup_location)
+     delivery = geocode_location(delivery_location)
++    coordinates = f"{pickup['longitude']},{pickup['latitude']};{delivery['longitude']},{delivery['latitude']}"
++    def fetch():
++        data = _get(f'{OSRM_URL}/{coordinates}', params={'overview':'false'})
++        if isinstance(data, dict) and data.get('code') == 'NoRoute':
++            raise LocationNotFound('No driving route was found')
++        try:
++            if data['code'] != 'Ok':
++                raise ValueError()
++            distance = float(data['routes'][0]['distance']) / 1000
++            if not math.isfinite(distance) or distance < 0:
++                raise ValueError()
++            return round(distance, 2)
++        except (KeyError, IndexError, TypeError, ValueError) as exc:
++            raise MapUnavailable('Map provider returned an invalid route') from exc
++    return {'distance_km':_cached(('route',coordinates), fetch), 'pickup':pickup, 'destination':delivery}
+ 
+-    # OSRM expects:
+-    # longitude,latitude
+-    coordinates = (
+-        f"{pickup['longitude']},{pickup['latitude']};"
+-        f"{delivery['longitude']},{delivery['latitude']}"
+-    )
+-
+-    url = f"{OSRM_URL}/{coordinates}"
+-
+-    params = {
+-        "overview": "false"
+-    }
+-
+-    response = requests.get(
+-        url,
+-        params=params,
+-        timeout=10
+-    )
+-
+-    response.raise_for_status()
+-
+-    data = response.json()
+-
+-    if data.get("code") != "Ok":
+-        raise ValueError(
+-            "Could not calculate route"
+-        )
+-
+-    distance_meters = data["routes"][0]["distance"]
+-
+-    distance_km = distance_meters / 1000
+-
+-    return round(distance_km, 2)+def get_route_distance(pickup_location, delivery_location):
++    return get_route_details(pickup_location, delivery_location)['distance_km']
+--- original/models.py
++++ farmdirect/models.py
+@@ -1,173 +1,118 @@
+-from sqlalchemy import Column, Integer, String, Float, ForeignKey
++"""CHANGED: decimal amounts, UTC dates, immutable order details and constraints."""
++from datetime import datetime, timezone
++from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, ForeignKey, Integer, Numeric, String
+ from sqlalchemy.orm import relationship
+ from database import Base
+ 
+ 
+-# One table for everyone (farmer or buyer). The "role" column tells them apart.
++def utcnow():
++    return datetime.now(timezone.utc)
++
++
+ class User(Base):
+-    __tablename__ = "users"
+-
+-    id = Column(Integer, primary_key=True, index=True)
++    __tablename__ = 'users'
++    __table_args__ = (CheckConstraint("role IN ('farmer','buyer','transporter')", name='ck_user_role'),)
++    id = Column(Integer, primary_key=True)
+     name = Column(String, nullable=False)
+     email = Column(String, unique=True, index=True, nullable=False)
+-    phone = Column(String, nullable=True)
++    phone = Column(String)
+     password_hash = Column(String, nullable=False)
+-    role = Column(String, nullable=False)  # "farmer" or "buyer"
+-    location = Column(String, nullable=True)
+-
+-    # If this user is a farmer, this links to their extra profile info below.
+-    farmer_profile = relationship("Farmer", back_populates="user", uselist=False)
++    role = Column(String, nullable=False)
++    location = Column(String)
++    farmer_profile = relationship('Farmer', back_populates='user', uselist=False)
+ 
+ 
+-# Extra info that only farmers need (matches the FARMERS table in your DB design).
+ class Farmer(Base):
+-    __tablename__ = "farmers"
+-
+-    id = Column(Integer, primary_key=True, index=True)
+-    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
+-    farm_name = Column(String, nullable=True)
+-    location = Column(String, nullable=True)
+-    rating = Column(Float, default=0.0)
+-
+-    user = relationship("User", back_populates="farmer_profile")
++    __tablename__ = 'farmers'
++    id = Column(Integer, primary_key=True)
++    user_id = Column(Integer, ForeignKey('users.id'), unique=True, nullable=False)
++    farm_name = Column(String)
++    # Farm address; User.location is the person's contact address. Legacy data is preserved.
++    location = Column(String)
++    user = relationship('User', back_populates='farmer_profile')
+ 
+ 
+ class Product(Base):
+-    __tablename__ = "products"
+-
+-    id = Column(Integer, primary_key=True, index=True)
+-
+-    # The farmer who owns this listing
+-    farmer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+-
++    __tablename__ = 'products'
++    __table_args__ = (
++        CheckConstraint('quantity >= 0 AND quantity <= 1000000', name='ck_product_quantity'),
++        CheckConstraint('price_per_unit > 0 AND price_per_unit <= 100000000', name='ck_product_price'),
++    )
++    id = Column(Integer, primary_key=True)
++    farmer_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
+     name = Column(String, nullable=False)
+-    description = Column(String, nullable=True)
+-
+-    quantity = Column(Float, nullable=False)
++    description = Column(String)
++    quantity = Column(Numeric(14, 3), nullable=False)  # Available stock, excluding reservations.
+     unit = Column(String, nullable=False)
+-
+-    price_per_unit = Column(Float, nullable=False)
+-
+-    location = Column(String, nullable=True)
+-
+-    farmer = relationship("User")
++    price_per_unit = Column(Numeric(16, 2), nullable=False)
++    location = Column(String)
++    is_active = Column(Boolean, nullable=False, default=True)
++    farmer = relationship('User')
+ 
+ 
+-from datetime import datetime
+-
+-# --------------------------------------------------
+-# ORDER
+-# Connects a buyer with a farmer's product.
+-# --------------------------------------------------
+ class Order(Base):
+-    __tablename__ = "orders"
+-
+-    id = Column(Integer, primary_key=True, index=True)
+-
+-    # Who placed the order
+-    buyer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+-
+-    # Which product was ordered
+-    product_id = Column(Integer, ForeignKey("products.id"), nullable=False)
+-
+-    # How much the buyer wants
+-    quantity = Column(Float, nullable=False)
+-
+-    # Price at the time the order was placed
+-    total_price = Column(Float, nullable=False)
+-
+-    # pending / accepted / rejected / completed
+-    status = Column(String, nullable=False, default="pending")
+-
+-    # Where the buyer wants the product delivered
+-    delivery_location = Column(String, nullable=True)
+-
+-    created_at = Column(
+-        String,
+-        default=lambda: datetime.utcnow().isoformat()
++    __tablename__ = 'orders'
++    __table_args__ = (
++        CheckConstraint('quantity > 0 AND quantity <= 1000000', name='ck_order_quantity'),
++        CheckConstraint('total_price >= 0 AND total_price <= 100000000000000', name='ck_order_price'),
++        CheckConstraint("status IN ('pending','accepted','rejected','completed','delivery_failed','returned','cancelled','expired')", name='ck_order_status'),
+     )
+-
+-    buyer = relationship("User")
+-    product = relationship("Product")
++    id = Column(Integer, primary_key=True)
++    buyer_id = Column(Integer, ForeignKey('users.id'), nullable=False, index=True)
++    product_id = Column(Integer, ForeignKey('products.id'), nullable=False, index=True)
++    quantity = Column(Numeric(14, 3), nullable=False)
++    total_price = Column(Numeric(18, 2), nullable=False)  # Product subtotal, kept for API compatibility.
++    status = Column(String, nullable=False, default='pending', index=True)
++    delivery_location = Column(String)
++    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
++    expires_at = Column(DateTime(timezone=True), index=True)
++    quote_id = Column(String, unique=True)
++    # Nullable for legacy orders whose original details cannot be reconstructed exactly.
++    product_name = Column(String)
++    unit = Column(String)
++    unit_price = Column(Numeric(16, 2))
++    pickup_location = Column(String)
++    transport_cost = Column(Numeric(16, 2))
++    grand_total = Column(Numeric(18, 2))
++    distance_km = Column(Numeric(12, 2))
++    vehicle_type = Column(String)
++    vehicle_rate = Column(Numeric(10, 2))
++    pickup_latitude = Column(Numeric(10, 7))
++    pickup_longitude = Column(Numeric(10, 7))
++    delivery_latitude = Column(Numeric(10, 7))
++    delivery_longitude = Column(Numeric(10, 7))
++    buyer = relationship('User')
++    product = relationship('Product')
+ 
+ 
+-from datetime import datetime
++class Transporter(Base):
++    __tablename__ = 'transporters'
++    __table_args__ = (
++        CheckConstraint('capacity_kg > 0 AND capacity_kg <= 1000000', name='ck_transporter_capacity'),
++        CheckConstraint("is_available IN ('available','busy')", name='ck_transporter_availability'),
++    )
++    id = Column(Integer, primary_key=True)
++    user_id = Column(Integer, ForeignKey('users.id'), unique=True, nullable=False)
++    vehicle_type = Column(String, nullable=False)
++    vehicle_number = Column(String, nullable=False, unique=True)
++    capacity_kg = Column(Numeric(14, 3), nullable=False)
++    is_available = Column(String, nullable=False, default='available')
++    user = relationship('User')
+ 
+ 
+-# --------------------------------------------------
+-# TRANSPORTER
+-# Extra profile information for users whose role
+-# is "transporter".
+-# --------------------------------------------------
+-class Transporter(Base):
+-    __tablename__ = "transporters"
+-
+-    id = Column(Integer, primary_key=True, index=True)
+-
+-    user_id = Column(
+-        Integer,
+-        ForeignKey("users.id"),
+-        unique=True,
+-        nullable=False
++class Delivery(Base):
++    __tablename__ = 'deliveries'
++    __table_args__ = (
++        CheckConstraint('transport_cost >= 0 AND transport_cost <= 100000000000000', name='ck_delivery_cost'),
++        CheckConstraint("status IN ('available','assigned','picked_up','in_transit','delivered','failed','returned')", name='ck_delivery_status'),
+     )
+-
+-    vehicle_type = Column(String, nullable=False)
+-    vehicle_number = Column(String, nullable=False, unique=True)
+-
+-    # Maximum weight the vehicle can carry.
+-    capacity_kg = Column(Float, nullable=False)
+-
+-    # True = transporter is currently available
+-    is_available = Column(
+-        String,
+-        nullable=False,
+-        default="available"
+-    )
+-
+-    user = relationship("User")
+-
+-
+-# --------------------------------------------------
+-# DELIVERY
+-# Created when a farmer accepts an order.
+-# --------------------------------------------------
+-class Delivery(Base):
+-    __tablename__ = "deliveries"
+-
+-    id = Column(Integer, primary_key=True, index=True)
+-
+-    # The order being transported
+-    order_id = Column(
+-        Integer,
+-        ForeignKey("orders.id"),
+-        unique=True,
+-        nullable=False
+-    )
+-
+-    # Transporter who accepts the delivery.
+-    # NULL until someone accepts it.
+-    transporter_id = Column(
+-        Integer,
+-        ForeignKey("users.id"),
+-        nullable=True
+-    )
+-
++    id = Column(Integer, primary_key=True)
++    order_id = Column(Integer, ForeignKey('orders.id'), unique=True, nullable=False)
++    transporter_id = Column(Integer, ForeignKey('users.id'), index=True)
+     pickup_location = Column(String, nullable=False)
+     delivery_location = Column(String, nullable=False)
+-
+-    transport_cost = Column(Float, nullable=False)
+-
+-    # available / assigned / picked_up / in_transit / delivered
+-    status = Column(
+-        String,
+-        nullable=False,
+-        default="available"
+-    )
+-
+-    created_at = Column(
+-        String,
+-        default=lambda: datetime.utcnow().isoformat()
+-    )
+-
+-    order = relationship("Order")
+-    transporter = relationship("User")+    transport_cost = Column(Numeric(18, 2), nullable=False)
++    status = Column(String, nullable=False, default='available', index=True)
++    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
++    order = relationship('Order')
++    transporter = relationship('User')
+--- original/order_routes.py
++++ farmdirect/routers/order_routes.py
+@@ -1,405 +1,98 @@
+-from fastapi import APIRouter, Depends, HTTPException
++from datetime import timedelta
++from decimal import Decimal
++from fastapi import APIRouter, Depends, HTTPException, Query
+ from sqlalchemy.orm import Session
++import auth, models, schemas
++from config import RESERVATION_HOURS
++from database import get_db
++from services.common import commit, get_or_404
++from services.orders import expired, release_stock
++from services.pricing import verify_quote
+ 
+-import auth
+-import models
+-import schemas
+-from database import get_db
++router = APIRouter(prefix='/orders', tags=['Orders'])
+ 
+-router = APIRouter(prefix="/orders", tags=["Orders"])
+-
+-
+-# ==================================================
+-# CREATE ORDER
+-# Only buyers can place orders.
+-#
+-# IMPORTANT:
+-# Stock is RESERVED immediately when the order is
+-# created. This prevents two buyers from ordering
+-# more stock than the farmer actually has.
+-# ==================================================
+-@router.post("/", response_model=schemas.OrderOut)
+-def create_order(
+-    order_in: schemas.OrderCreate,
+-    db: Session = Depends(get_db),
+-    current_user: models.User = Depends(auth.get_current_user)
+-):
+-    # --------------------------------------------------
+-    # Only buyers can place orders
+-    # --------------------------------------------------
+-    if current_user.role != "buyer":
+-        raise HTTPException(
+-            status_code=403,
+-            detail="Only buyers can place orders"
+-        )
+-
+-    # --------------------------------------------------
+-    # Basic quantity validation
+-    # --------------------------------------------------
+-    if order_in.quantity <= 0:
+-        raise HTTPException(
+-            status_code=400,
+-            detail="Quantity must be greater than 0"
+-        )
+-
+-    # --------------------------------------------------
+-    # Find product and lock its row.
+-    #
+-    # with_for_update() helps prevent two simultaneous
+-    # buyers from reserving the same stock.
+-    # PostgreSQL supports this row lock.
+-    # --------------------------------------------------
+-    product = (
+-        db.query(models.Product)
+-        .filter(models.Product.id == order_in.product_id)
+-        .with_for_update()
+-        .first()
+-    )
+-
+-    if not product:
+-        raise HTTPException(
+-            status_code=404,
+-            detail="Product not found"
+-        )
+-
+-    # --------------------------------------------------
+-    # Make sure enough stock exists
+-    # --------------------------------------------------
+-    if order_in.quantity > product.quantity:
+-        raise HTTPException(
+-            status_code=400,
+-            detail=f"Only {product.quantity} {product.unit} available"
+-        )
+-
+-    # --------------------------------------------------
+-    # Calculate total price
+-    # --------------------------------------------------
+-    total_price = (
+-        order_in.quantity * product.price_per_unit
+-    )
+-
+-    # --------------------------------------------------
+-    # Delivery location
+-    # Use buyer's saved location if they don't
+-    # provide one.
+-    # --------------------------------------------------
+-    delivery_location = (
+-        order_in.delivery_location
+-        or current_user.location
+-    )
+-
+-    # --------------------------------------------------
+-    # RESERVE / DEDUCT STOCK
+-    # --------------------------------------------------
++@router.post('/', response_model=schemas.OrderOut, status_code=201)
++def create_order(order_in: schemas.OrderCreate, db: Session = Depends(get_db),
++                 user: models.User = Depends(auth.require_buyer)):
++    destination = order_in.delivery_location or user.location
++    product = get_or_404(db, models.Product, order_in.product_id, lock=True)
++    q = verify_quote(order_in.quote_token, product, order_in, destination, user.id)
++    existing = db.query(models.Order).filter(models.Order.quote_id == q['jti']).first()
++    if existing:
++        return existing  # Retry of the same checkout cannot reserve stock twice.
++    if not product.is_active or order_in.quantity > product.quantity:
++        raise HTTPException(409, 'Product is unavailable or has insufficient stock')
+     product.quantity -= order_in.quantity
+-
+-    # --------------------------------------------------
+-    # Create the order
+-    # --------------------------------------------------
+-    new_order = models.Order(
+-        buyer_id=current_user.id,
+-        product_id=product.id,
+-        quantity=order_in.quantity,
+-        total_price=total_price,
+-        status="pending",
+-        delivery_location=delivery_location
+-    )
+-
+-    db.add(new_order)
+-
+-    try:
+-        db.commit()
+-        db.refresh(new_order)
+-
+-    except Exception:
+-        db.rollback()
+-        raise HTTPException(
+-            status_code=500,
+-            detail="Could not create order"
+-        )
+-
+-    return new_order
+-
+-
+-# ==================================================
+-# GET MY ORDERS
+-# Buyer sees only their own orders.
+-# ==================================================
+-@router.get("/my", response_model=list[schemas.OrderOut])
+-def get_my_orders(
+-    db: Session = Depends(get_db),
+-    current_user: models.User = Depends(auth.get_current_user)
+-):
+-    if current_user.role != "buyer":
+-        raise HTTPException(
+-            status_code=403,
+-            detail="Only buyers can view their orders"
+-        )
+-
+-    return (
+-        db.query(models.Order)
+-        .filter(models.Order.buyer_id == current_user.id)
+-        .all()
+-    )
+-
+-
+-# ==================================================
+-# GET FARMER ORDERS
+-# Farmer sees orders for their own products.
+-# ==================================================
+-@router.get("/farmer", response_model=list[schemas.OrderOut])
+-def get_farmer_orders(
+-    db: Session = Depends(get_db),
+-    current_user: models.User = Depends(auth.get_current_user)
+-):
+-    if current_user.role != "farmer":
+-        raise HTTPException(
+-            status_code=403,
+-            detail="Only farmers can view farmer orders"
+-        )
+-
+-    return (
+-        db.query(models.Order)
+-        .join(
+-            models.Product,
+-            models.Order.product_id == models.Product.id
+-        )
+-        .filter(
+-            models.Product.farmer_id == current_user.id
+-        )
+-        .all()
+-    )
+-
+-
+-# ==================================================
+-# ACCEPT / REJECT ORDER
+-#
+-# Farmer can:
+-#   pending -> accepted
+-#   pending -> rejected
+-#
+-# If rejected:
+-#   Reserved stock is returned to the product.
+-#
+-# If accepted:
+-#   A Delivery is automatically created.
+-# ==================================================
+-@router.put(
+-    "/{order_id}/status",
+-    response_model=schemas.OrderOut
+-)
+-def update_order_status(
+-    order_id: int,
+-    status_update: schemas.OrderStatusUpdate,
+-    db: Session = Depends(get_db),
+-    current_user: models.User = Depends(auth.get_current_user)
+-):
+-    # --------------------------------------------------
+-    # Only farmers can accept/reject
+-    # --------------------------------------------------
+-    if current_user.role != "farmer":
+-        raise HTTPException(
+-            status_code=403,
+-            detail="Only farmers can update order status"
+-        )
+-
+-    # --------------------------------------------------
+-    # Farmer can only make these two decisions here
+-    # --------------------------------------------------
+-    if status_update.status not in ("accepted", "rejected"):
+-        raise HTTPException(
+-            status_code=400,
+-            detail="Status must be accepted or rejected"
+-        )
+-
+-    # --------------------------------------------------
+-    # Find order
+-    # --------------------------------------------------
+-    order = (
+-        db.query(models.Order)
+-        .filter(models.Order.id == order_id)
+-        .with_for_update()
+-        .first()
+-    )
+-
+-    if not order:
+-        raise HTTPException(
+-            status_code=404,
+-            detail="Order not found"
+-        )
+-
+-    # --------------------------------------------------
+-    # Only pending orders can be accepted/rejected
+-    # --------------------------------------------------
+-    if order.status != "pending":
+-        raise HTTPException(
+-            status_code=400,
+-            detail="Only pending orders can be accepted or rejected"
+-        )
+-
+-    # --------------------------------------------------
+-    # Find product
+-    # --------------------------------------------------
+-    product = (
+-        db.query(models.Product)
+-        .filter(models.Product.id == order.product_id)
+-        .with_for_update()
+-        .first()
+-    )
+-
+-    if not product:
+-        raise HTTPException(
+-            status_code=404,
+-            detail="Product not found"
+-        )
+-
+-    # --------------------------------------------------
+-    # Ownership check
+-    # The farmer must own the product.
+-    # --------------------------------------------------
+-    if product.farmer_id != current_user.id:
+-        raise HTTPException(
+-            status_code=403,
+-            detail="You can only manage orders for your own products"
+-        )
+-
+-    # ==================================================
+-    # REJECT ORDER
+-    # ==================================================
+-    if status_update.status == "rejected":
+-
+-        # Return the previously reserved stock
+-        product.quantity += order.quantity
+-
+-        # Mark order rejected
+-        order.status = "rejected"
+-
+-    # ==================================================
+-    # ACCEPT ORDER
+-    # ==================================================
+-    elif status_update.status == "accepted":
+-
+-        order.status = "accepted"
+-
+-        # --------------------------------------------------
+-        # Create a delivery request automatically.
+-        # The transporter will later accept this delivery.
+-        # --------------------------------------------------
+-
+-        existing_delivery = (
+-            db.query(models.Delivery)
+-            .filter(models.Delivery.order_id == order.id)
+-            .first()
+-        )
+-
+-        if not existing_delivery:
+-
+-            delivery = models.Delivery(
+-                order_id=order.id,
+-                pickup_location=(
+-                    product.location
+-                    or current_user.location
+-                    or "Unknown"
+-                ),
+-                delivery_location=(
+-                    order.delivery_location
+-                    or "Unknown"
+-                ),
+-                transport_cost=0.0,
+-                status="available"
+-            )
+-
+-            db.add(delivery)
+-
+-    # --------------------------------------------------
+-    # Save everything
+-    # --------------------------------------------------
+-    try:
+-        db.commit()
+-        db.refresh(order)
+-
+-    except Exception:
+-        db.rollback()
+-        raise HTTPException(
+-            status_code=500,
+-            detail="Could not update order"
+-        )
+-
++    order = models.Order(buyer_id=user.id, product_id=product.id, quantity=order_in.quantity,
++        total_price=Decimal(q['product_cost']), status='pending', delivery_location=destination,
++        expires_at=models.utcnow() + timedelta(hours=RESERVATION_HOURS), quote_id=q['jti'],
++        product_name=product.name, unit='kg', unit_price=product.price_per_unit,
++        pickup_location=product.location, transport_cost=Decimal(q['transport_cost']),
++        grand_total=Decimal(q['estimated_total']), distance_km=Decimal(q['distance_km']),
++        vehicle_type=q['vehicle_type'], vehicle_rate=Decimal(q['vehicle_rate_per_km']),
++        pickup_latitude=Decimal(str(q['pickup']['latitude'])),
++        pickup_longitude=Decimal(str(q['pickup']['longitude'])),
++        delivery_latitude=Decimal(str(q['delivery']['latitude'])),
++        delivery_longitude=Decimal(str(q['delivery']['longitude'])))
++    db.add(order)
++    commit(db)
+     return order
+ 
++@router.get('/my', response_model=list[schemas.OrderOut])
++def get_my_orders(db: Session = Depends(get_db), user: models.User = Depends(auth.require_buyer),
++                  offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=100)):
++    return (db.query(models.Order).filter(models.Order.buyer_id == user.id)
++            .order_by(models.Order.id.desc()).offset(offset).limit(limit).all())
+ 
+-# ==================================================
+-# GET ONE ORDER
+-#
+-# Buyer:
+-#   only their own order
+-#
+-# Farmer:
+-#   only orders for their own products
+-# ==================================================
+-@router.get(
+-    "/{order_id}",
+-    response_model=schemas.OrderOut
+-)
+-def get_order(
+-    order_id: int,
+-    db: Session = Depends(get_db),
+-    current_user: models.User = Depends(auth.get_current_user)
+-):
+-    order = (
+-        db.query(models.Order)
+-        .filter(models.Order.id == order_id)
+-        .first()
+-    )
++@router.get('/farmer', response_model=list[schemas.OrderOut])
++def get_farmer_orders(db: Session = Depends(get_db), user: models.User = Depends(auth.require_farmer),
++                      offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=100)):
++    return (db.query(models.Order).join(models.Product).filter(models.Product.farmer_id == user.id)
++            .order_by(models.Order.id.desc()).offset(offset).limit(limit).all())
+ 
+-    if not order:
+-        raise HTTPException(
+-            status_code=404,
+-            detail="Order not found"
+-        )
++@router.put('/{order_id}/status', response_model=schemas.OrderOut)
++def update_order_status(order_id: int, status_update: schemas.OrderStatusUpdate,
++                        db: Session = Depends(get_db), user: models.User = Depends(auth.require_farmer)):
++    order = get_or_404(db, models.Order, order_id, lock=True)
++    product = get_or_404(db, models.Product, order.product_id, lock=True)
++    if product.farmer_id != user.id:
++        raise HTTPException(403, 'You can only manage orders for your products')
++    if order.status != 'pending':
++        raise HTTPException(409, 'Only pending orders can be accepted or rejected')
++    if expired(order):
++        release_stock(db, order, 'expired')
++        commit(db)
++        raise HTTPException(409, 'Reservation expired; stock has been released')
++    if status_update.status == 'rejected':
++        release_stock(db, order, 'rejected')
++    else:
++        if order.transport_cost is None or not order.pickup_location or not order.delivery_location:
++            raise HTTPException(409, 'Legacy order has no agreed delivery quote; reject and ask buyer to reorder')
++        order.status = 'accepted'
++        db.add(models.Delivery(order_id=order.id, pickup_location=order.pickup_location,
++            delivery_location=order.delivery_location, transport_cost=order.transport_cost, status='available'))
++    commit(db)
++    return order
+ 
+-    # --------------------------------------------------
+-    # Buyer access
+-    # --------------------------------------------------
+-    if current_user.role == "buyer":
++@router.post('/{order_id}/cancel', response_model=schemas.OrderOut)
++def cancel_order(order_id: int, db: Session = Depends(get_db),
++                 user: models.User = Depends(auth.require_buyer)):
++    order = get_or_404(db, models.Order, order_id, lock=True)
++    if order.buyer_id != user.id:
++        raise HTTPException(403, 'You can only cancel your own orders')
++    if order.status in {'cancelled','expired'}:
++        return order
++    release_stock(db, order, 'expired' if expired(order) else 'cancelled')
++    commit(db)
++    return order
+ 
+-        if order.buyer_id != current_user.id:
+-            raise HTTPException(
+-                status_code=403,
+-                detail="You can only view your own orders"
+-            )
+-
+-    # --------------------------------------------------
+-    # Farmer access
+-    # --------------------------------------------------
+-    elif current_user.role == "farmer":
+-
+-        product = (
+-            db.query(models.Product)
+-            .filter(models.Product.id == order.product_id)
+-            .first()
+-        )
+-
+-        if not product:
+-            raise HTTPException(
+-                status_code=404,
+-                detail="Product not found"
+-            )
+-
+-        if product.farmer_id != current_user.id:
+-            raise HTTPException(
+-                status_code=403,
+-                detail="You can only view orders for your own products"
+-            )
+-
+-    # --------------------------------------------------
+-    # Transporters cannot use this endpoint to view
+-    # arbitrary orders.
+-    # --------------------------------------------------
+-    else:
+-        raise HTTPException(
+-            status_code=403,
+-            detail="Invalid user role"
+-        )
+-
+-    return order+@router.get('/{order_id}', response_model=schemas.OrderOut)
++def get_order(order_id: int, db: Session = Depends(get_db),
++              user: models.User = Depends(auth.get_current_user)):
++    order = get_or_404(db, models.Order, order_id)
++    allowed = user.role == 'buyer' and order.buyer_id == user.id
++    if user.role == 'farmer':
++        allowed = order.product.farmer_id == user.id
++    if not allowed:
++        raise HTTPException(403, 'You cannot view this order')
++    return order
+--- original/product_routes.py
++++ farmdirect/routers/product_routes.py
+@@ -1,213 +1,95 @@
+-from fastapi import APIRouter, Depends, HTTPException
++from decimal import Decimal
++from fastapi import APIRouter, Depends, HTTPException, Query
+ from sqlalchemy.orm import Session
++import auth, models, schemas
++from database import get_db
++from services.common import get_or_404, commit
+ 
+-import auth
+-import models
+-import schemas
+-from database import get_db
++router = APIRouter(prefix='/products', tags=['Products'])
+ 
+-router = APIRouter(prefix="/products", tags=["Products"])
+-
+-
+-# --------------------------------------------------
+-# CREATE PRODUCT
+-# Only logged-in farmers can create products.
+-# --------------------------------------------------
+-@router.post("/", response_model=schemas.ProductOut)
+-def create_product(
+-    product_in: schemas.ProductCreate,
+-    db: Session = Depends(get_db),
+-    current_user: models.User = Depends(auth.get_current_user)
+-):
+-    if current_user.role != "farmer":
+-        raise HTTPException(
+-            status_code=403,
+-            detail="Only farmers can create product listings"
+-        )
+-
+-    new_product = models.Product(
+-        farmer_id=current_user.id,
+-        name=product_in.name,
+-        description=product_in.description,
+-        quantity=product_in.quantity,
+-        unit=product_in.unit,
+-        price_per_unit=product_in.price_per_unit,
+-        location=product_in.location or current_user.location
+-    )
+-
+-    db.add(new_product)
+-    db.commit()
+-    db.refresh(new_product)
+-
+-    return new_product
+-
+-
+-# --------------------------------------------------
+-# GET ALL PRODUCTS
+-# Anyone can view products.
+-# --------------------------------------------------
+-@router.get("/", response_model=list[schemas.ProductOut])
+-def get_products(
+-    db: Session = Depends(get_db)
+-):
+-    return db.query(models.Product).all()
+-
+-
+-# --------------------------------------------------
+-# UPDATE PRODUCT
+-# Only the farmer who owns the product can update it.
+-# --------------------------------------------------
+-@router.put("/{product_id}", response_model=schemas.ProductOut)
+-def update_product(
+-    product_id: int,
+-    product_in: schemas.ProductUpdate,
+-    db: Session = Depends(get_db),
+-    current_user: models.User = Depends(auth.get_current_user)
+-):
+-    # Only farmers can update products
+-    if current_user.role != "farmer":
+-        raise HTTPException(
+-            status_code=403,
+-            detail="Only farmers can update products"
+-        )
+-
+-    # Find the product
+-    product = (
+-        db.query(models.Product)
+-        .filter(models.Product.id == product_id)
+-        .first()
+-    )
+-
+-    if not product:
+-        raise HTTPException(
+-            status_code=404,
+-            detail="Product not found"
+-        )
+-
+-    # Ownership check
+-    if product.farmer_id != current_user.id:
+-        raise HTTPException(
+-            status_code=403,
+-            detail="You can only update your own products"
+-        )
+-
+-    # Only update fields that were actually provided
+-    update_data = product_in.model_dump(exclude_unset=True)
+-
+-    for field, value in update_data.items():
+-        setattr(product, field, value)
+-
+-    db.commit()
+-    db.refresh(product)
+-
++@router.post('/', response_model=schemas.ProductOut, status_code=201)
++def create_product(product_in: schemas.ProductCreate, db: Session = Depends(get_db),
++                   user: models.User = Depends(auth.require_farmer)):
++    data = product_in.model_dump()
++    data['location'] = data['location'] or (user.farmer_profile.location if user.farmer_profile else None) or user.location
++    if not data['location'] or data['location'].strip().lower() == 'unknown':
++        raise HTTPException(422, 'A pickup location is required')
++    product = models.Product(**data, farmer_id=user.id)
++    db.add(product)
++    commit(db)
+     return product
+ 
++@router.get('/', response_model=list[schemas.ProductOut])
++@router.get('/search', response_model=list[schemas.ProductOut])
++def get_products(name: str | None = Query(None, max_length=250),
++                 location: str | None = Query(None, max_length=250),
++                 min_price: Decimal | None = Query(None, ge=0, le=100000000),
++                 max_price: Decimal | None = Query(None, ge=0, le=100000000),
++                 offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=100),
++                 db: Session = Depends(get_db)):
++    if min_price is not None and max_price is not None and min_price > max_price:
++        raise HTTPException(422, 'min_price cannot exceed max_price')
++    query = db.query(models.Product).filter(models.Product.is_active.is_(True))
++    if name:
++        query = query.filter(models.Product.name.ilike(f'%{name}%'))
++    if location:
++        query = query.filter(models.Product.location.ilike(f'%{location}%'))
++    if min_price is not None:
++        query = query.filter(models.Product.price_per_unit >= min_price)
++    if max_price is not None:
++        query = query.filter(models.Product.price_per_unit <= max_price)
++    return query.order_by(models.Product.id).offset(offset).limit(limit).all()
+ 
+-# --------------------------------------------------
+-# DELETE PRODUCT
+-# Only the farmer who owns the product can delete it.
+-# --------------------------------------------------
+-@router.delete("/{product_id}")
+-def delete_product(
+-    product_id: int,
+-    db: Session = Depends(get_db),
+-    current_user: models.User = Depends(auth.get_current_user)
+-):
+-    # Only farmers can delete products
+-    if current_user.role != "farmer":
+-        raise HTTPException(
+-            status_code=403,
+-            detail="Only farmers can delete products"
+-        )
++def owned_product(db, product_id, user):
++    product = get_or_404(db, models.Product, product_id, lock=True)
++    if product.farmer_id != user.id:
++        raise HTTPException(403, 'You can only modify your own listings')
++    if not product.is_active:
++        raise HTTPException(409, 'Listing is archived')
++    return product
+ 
+-    # Find the product
+-    product = (
+-        db.query(models.Product)
+-        .filter(models.Product.id == product_id)
+-        .first()
+-    )
++@router.patch('/{product_id}', response_model=schemas.ProductOut)
++@router.put('/{product_id}', response_model=schemas.ProductOut, deprecated=True)
++def update_product(product_id: int, product_in: schemas.ProductUpdate,
++                   db: Session = Depends(get_db), user: models.User = Depends(auth.require_farmer)):
++    product = owned_product(db, product_id, user)
++    data = product_in.model_dump(exclude_unset=True)
++    if 'unit' in data and data['unit'] != product.unit:
++        if db.query(models.Order.id).filter(models.Order.product_id == product.id,
++                models.Order.status.in_(['pending','accepted','delivery_failed'])).first():
++            raise HTTPException(409, 'Cannot change units while orders are active')
++        if 'quantity' not in data or 'price_per_unit' not in data:
++            raise HTTPException(422, 'Unit conversion requires converted quantity and price_per_unit')
++    if 'quantity' in data and db.query(models.Order.id).filter(models.Order.product_id == product.id,
++            models.Order.status.in_(['pending','accepted','delivery_failed'])).first():
++        raise HTTPException(409, 'Active orders exist; use /stock-adjustment to adjust available stock')
++    for field, value in data.items():
++        setattr(product, field, value)
++    commit(db)
++    return product
+ 
+-    if not product:
+-        raise HTTPException(
+-            status_code=404,
+-            detail="Product not found"
+-        )
++@router.post('/{product_id}/stock-adjustment', response_model=schemas.ProductOut)
++def adjust_stock(product_id: int, data: schemas.StockAdjustment,
++                 db: Session = Depends(get_db), user: models.User = Depends(auth.require_farmer)):
++    product = owned_product(db, product_id, user)
++    quantity = product.quantity + data.delta
++    if not 0 <= quantity <= 1000000:
++        raise HTTPException(409, 'Resulting available stock must be between 0 and 1000000 kg')
++    product.quantity = quantity
++    commit(db)
++    return product
+ 
+-    # Ownership check
+-    if product.farmer_id != current_user.id:
+-        raise HTTPException(
+-            status_code=403,
+-            detail="You can only delete your own products"
+-        )
++@router.delete('/{product_id}')
++def delete_product(product_id: int, db: Session = Depends(get_db),
++                   user: models.User = Depends(auth.require_farmer)):
++    product = owned_product(db, product_id, user)
++    product.is_active = False  # CHANGED: preserve references and order history.
++    commit(db)
++    return {'message':'Product archived; existing orders remain available'}
+ 
+-    db.delete(product)
+-    db.commit()
+-
+-    return {
+-        "message": "Product deleted successfully"
+-    }
+-
+-
+-# --------------------------------------------------
+-# SEARCH / FILTER PRODUCTS
+-# Buyers can search by name, location, and price.
+-# --------------------------------------------------
+-@router.get("/search", response_model=list[schemas.ProductOut])
+-def search_products(
+-    name: str | None = None,
+-    location: str | None = None,
+-    min_price: float | None = None,
+-    max_price: float | None = None,
+-    db: Session = Depends(get_db)
+-):
+-    query = db.query(models.Product)
+-
+-    # Search by crop/product name
+-    if name:
+-        query = query.filter(
+-            models.Product.name.ilike(f"%{name}%")
+-        )
+-
+-    # Filter by location
+-    if location:
+-        query = query.filter(
+-            models.Product.location.ilike(f"%{location}%")
+-        )
+-
+-    # Filter by minimum price
+-    if min_price is not None:
+-        query = query.filter(
+-            models.Product.price_per_unit >= min_price
+-        )
+-
+-    # Filter by maximum price
+-    if max_price is not None:
+-        query = query.filter(
+-            models.Product.price_per_unit <= max_price
+-        )
+-
+-    return query.all()
+-
+-
+-# --------------------------------------------------
+-# GET ONE PRODUCT
+-# Anyone can view a specific product.
+-# --------------------------------------------------
+-@router.get("/{product_id}", response_model=schemas.ProductOut)
+-def get_product(
+-    product_id: int,
+-    db: Session = Depends(get_db)
+-):
+-    product = (
+-        db.query(models.Product)
+-        .filter(models.Product.id == product_id)
+-        .first()
+-    )
+-
+-    if not product:
+-        raise HTTPException(
+-            status_code=404,
+-            detail="Product not found"
+-        )
+-
++@router.get('/{product_id}', response_model=schemas.ProductOut)
++def get_product(product_id: int, db: Session = Depends(get_db)):
++    product = get_or_404(db, models.Product, product_id)
++    if not product.is_active:
++        raise HTTPException(404, 'Product not found')
+     return product
+--- original/requirements.txt
++++ farmdirect/requirements.txt
+@@ -1,8 +1,14 @@
+-fastapi
+-uvicorn[standard]
+-sqlalchemy
+-psycopg2-binary
+-python-dotenv
+-passlib[bcrypt]
+-python-jose[cryptography]
+-pydantic[email]
++# Explicit compatibility ranges; full installation could not be tested in the authoring environment.
++fastapi>=0.115.12,<1
++uvicorn[standard]>=0.34.2,<1
++SQLAlchemy>=2.0.40,<2.1
++psycopg2-binary>=2.9.10,<3
++python-dotenv>=1.1.0,<2
++passlib[bcrypt]==1.7.4
++# Required for compatibility with passlib 1.7.4 and existing bcrypt hashes.
++bcrypt==4.0.1
++python-jose[cryptography]>=3.4.0,<4
++pydantic[email]>=2.11.4,<3
++requests>=2.32.4,<3
++python-multipart>=0.0.20,<1
++alembic>=1.15.2,<2
+--- original/schemas.py
++++ farmdirect/schemas.py
+@@ -1,163 +1,153 @@
+-from typing import Optional
++"""CHANGED: validate at the API boundary; keep separate status contracts."""
++from datetime import datetime
++from decimal import Decimal
++from typing import Annotated, Literal
++from pydantic import BaseModel, ConfigDict, EmailStr, Field, StringConstraints, field_validator
+ 
+-from pydantic import BaseModel, EmailStr
++Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=250)]
++Weight = Annotated[Decimal, Field(gt=0, le=1000000, max_digits=14, decimal_places=3)]
++Stock = Annotated[Decimal, Field(ge=0, le=1000000, max_digits=14, decimal_places=3)]
++Price = Annotated[Decimal, Field(gt=0, le=100000000, max_digits=16, decimal_places=2)]
++CoordinatesLatitude = Annotated[Decimal, Field(ge=-90, le=90, decimal_places=7)]
++CoordinatesLongitude = Annotated[Decimal, Field(ge=-180, le=180, decimal_places=7)]
+ 
++class Input(BaseModel):
++    model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
+ 
+-# ==================================================
+-# USER REGISTRATION SCHEMAS
+-# ==================================================
++class Output(BaseModel):
++    model_config = ConfigDict(from_attributes=True)
+ 
+-class BaseUserRegister(BaseModel):
+-    name: str
++class BaseUserRegister(Input):
++    name: Text
+     email: EmailStr
+-    phone: Optional[str] = None
+-    password: str
+-    location: Optional[str] = None
++    phone: Text | None = None
++    password: Annotated[str, Field(min_length=8, max_length=72)]
++    location: Text | None = None
+ 
++    @field_validator('password')
++    @classmethod
++    def bcrypt_limit(cls, value):
++        if len(value.encode('utf-8')) > 72:
++            raise ValueError('Password must be at most 72 UTF-8 bytes')
++        return value
+ 
+ class FarmerRegister(BaseUserRegister):
+-    farm_name: Optional[str] = None
+-
++    farm_name: Text | None = None
++    farm_location: Text | None = None
+ 
+ class BuyerRegister(BaseUserRegister):
+     pass
+ 
++class TransporterRegister(BaseUserRegister):
++    vehicle_type: Text
++    vehicle_number: Text
++    capacity_kg: Weight
+ 
+-class TransporterRegister(BaseUserRegister):
+-    vehicle_type: str
+-    vehicle_number: str
+-    capacity_kg: float
++    @field_validator('vehicle_number')
++    @classmethod
++    def normalize_vehicle(cls, value):
++        return value.upper().replace(' ', '').replace('-', '')
+ 
+-
+-# ==================================================
+-# LOGIN
+-# ==================================================
+-
+-class UserLogin(BaseModel):
+-    email: EmailStr
+-    password: str
+-
+-
+-# ==================================================
+-# USER RESPONSE
+-# ==================================================
+-
+-class UserOut(BaseModel):
++class UserOut(Output):
+     id: int
+     name: str
+     email: str
+     role: str
+-    location: Optional[str] = None
++    location: str | None = None
+ 
+-    class Config:
+-        orm_mode = True
++class Token(Output):
++    access_token: str
++    token_type: str = 'bearer'
+ 
++class ProductCreate(Input):
++    name: Text
++    description: Annotated[str, Field(max_length=5000)] | None = None
++    quantity: Stock
++    unit: Text
++    price_per_unit: Price
++    location: Text | None = None
+ 
+-# ==================================================
+-# TOKEN
+-# ==================================================
++    @field_validator('unit')
++    @classmethod
++    def kilograms(cls, value):
++        if value.lower() not in {'kg','kgs','kilogram','kilograms'}:
++            raise ValueError('This prototype supports kilograms only; use kg')
++        return 'kg'
+ 
+-class Token(BaseModel):
+-    access_token: str
+-    token_type: str = "bearer"
++class ProductUpdate(Input):
++    name: Text | None = None
++    description: Annotated[str, Field(max_length=5000)] | None = None
++    quantity: Stock | None = None
++    unit: Text | None = None
++    price_per_unit: Price | None = None
++    location: Text | None = None
+ 
++    @field_validator('name', 'quantity', 'unit', 'price_per_unit', 'location')
++    @classmethod
++    def not_null(cls, value):
++        if value is None:
++            raise ValueError('Omit this field instead of sending null')
++        return value
+ 
+-# ==================================================
+-# PRODUCT
+-# ==================================================
++    @field_validator('unit')
++    @classmethod
++    def kilograms(cls, value):
++        return ProductCreate.kilograms(value)
+ 
+-class ProductCreate(BaseModel):
+-    name: str
+-    description: Optional[str] = None
+-    quantity: float
+-    unit: str
+-    price_per_unit: float
+-    location: Optional[str] = None
++class StockAdjustment(Input):
++    delta: Annotated[Decimal, Field(ge=-1000000, le=1000000, decimal_places=3)]
+ 
+-
+-class ProductOut(BaseModel):
++class ProductOut(Output):
+     id: int
+     farmer_id: int
+     name: str
+-    description: Optional[str] = None
+-    quantity: float
++    description: str | None
++    quantity: Decimal
+     unit: str
+-    price_per_unit: float
+-    location: Optional[str] = None
++    price_per_unit: Decimal
++    location: str | None
++    is_active: bool
+ 
+-    class Config:
+-        orm_mode = True
++class OrderCreate(Input):
++    product_id: Annotated[int, Field(gt=0)]
++    quantity: Weight
++    delivery_location: Text | None = None
++    # Use the /deliveries/estimate quote to confirm the displayed price and coordinates.
++    quote_token: str
+ 
+-
+-class ProductUpdate(BaseModel):
+-    name: Optional[str] = None
+-    description: Optional[str] = None
+-    quantity: Optional[float] = None
+-    unit: Optional[str] = None
+-    price_per_unit: Optional[float] = None
+-    location: Optional[str] = None
+-
+-
+-# ==================================================
+-# TRANSPORTER RESPONSE
+-# ==================================================
+-
+-class TransporterOut(BaseModel):
+-    id: int
+-    user_id: int
+-    vehicle_type: str
+-    vehicle_number: str
+-    capacity_kg: float
+-    is_available: str
+-
+-    class Config:
+-        orm_mode = True
+-
+-
+-# ==================================================
+-# DELIVERY RESPONSE
+-# ==================================================
+-
+-class DeliveryOut(BaseModel):
+-    id: int
+-    order_id: int
+-
+-    product_name: str
+-    quantity: float
+-    unit: str
+-
+-    pickup_location: str
+-    delivery_location: str
+-    transport_cost: float
+-    status: str
+-
+-    class Config:
+-        orm_mode = True
+-
+-
+-# ==================================================
+-# ORDER
+-# ==================================================
+-
+-class OrderCreate(BaseModel):
+-    product_id: int
+-    quantity: float
+-    delivery_location: Optional[str] = None
+-
+-
+-class OrderOut(BaseModel):
++class OrderOut(Output):
+     id: int
+     buyer_id: int
+     product_id: int
+-    quantity: float
+-    total_price: float
++    quantity: Decimal
++    total_price: Decimal
+     status: str
+-    delivery_location: Optional[str] = None
+-    created_at: str
++    delivery_location: str | None
++    created_at: datetime
++    expires_at: datetime | None
++    product_name: str | None
++    unit: str | None
++    unit_price: Decimal | None
++    pickup_location: str | None
++    transport_cost: Decimal | None
++    grand_total: Decimal | None
++    distance_km: Decimal | None
++    vehicle_type: str | None
+ 
+-    class Config:
+-        orm_mode = True
++class OrderStatusUpdate(Input):
++    status: Literal['accepted', 'rejected']
+ 
++class DeliveryStatusUpdate(Input):
++    status: Literal['picked_up', 'in_transit', 'delivered', 'failed']
+ 
+-class OrderStatusUpdate(BaseModel):
+-    status: str+class DeliveryOut(Output):
++    id: int
++    order_id: int
++    transporter_id: int | None
++    product_name: str
++    quantity: Decimal
++    unit: str
++    pickup_location: str
++    delivery_location: str
++    transport_cost: Decimal
++    status: str
